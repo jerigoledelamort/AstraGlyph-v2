@@ -1,0 +1,21 @@
+# Rust
+/target
+debug/
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local-only files
+COMMIT_GUIDELINES.md
+AGENTS.md
+
+# Agent artifacts
+.agent/
