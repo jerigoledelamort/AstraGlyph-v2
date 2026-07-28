@@ -24,6 +24,10 @@ pub fn build_scene() -> (Scene, Camera) {
     // --- Walls ---
     // Each wall is a pair of triangles (4 vertices, 6 indices).
 
+    let white = Vec3::new(0.73, 0.73, 0.73);
+    let red = Vec3::new(0.63, 0.065, 0.065);
+    let green = Vec3::new(0.12, 0.45, 0.15);
+
     // Floor (white)
     let floor = create_box_wall(
         Vec3::new(-s, -s, -s),
@@ -31,6 +35,7 @@ pub fn build_scene() -> (Scene, Camera) {
         Vec3::new(s, -s, s),
         Vec3::new(-s, -s, s),
         Vec3::UNIT_Y,
+        white,
     );
     add_mesh_entity(&mut scene, floor, MaterialComponent::new(
         Vec4::new(0.73, 0.73, 0.73, 1.0), 0.1, 0.9,
@@ -43,6 +48,7 @@ pub fn build_scene() -> (Scene, Camera) {
         Vec3::new(s, s, s),
         Vec3::new(s, s, -s),
         Vec3::new(0.0, -1.0, 0.0),
+        white,
     );
     add_mesh_entity(&mut scene, ceiling, MaterialComponent::new(
         Vec4::new(0.73, 0.73, 0.73, 1.0), 0.1, 0.9,
@@ -55,6 +61,7 @@ pub fn build_scene() -> (Scene, Camera) {
         Vec3::new(s, s, -s),
         Vec3::new(s, -s, -s),
         Vec3::UNIT_Z,
+        white,
     );
     add_mesh_entity(&mut scene, back, MaterialComponent::new(
         Vec4::new(0.73, 0.73, 0.73, 1.0), 0.1, 0.9,
@@ -67,6 +74,7 @@ pub fn build_scene() -> (Scene, Camera) {
         Vec3::new(-s, s, s),
         Vec3::new(-s, s, -s),
         Vec3::UNIT_X,
+        red,
     );
     add_mesh_entity(&mut scene, left, MaterialComponent::new(
         Vec4::new(0.63, 0.065, 0.065, 1.0), 0.1, 0.9,
@@ -79,6 +87,7 @@ pub fn build_scene() -> (Scene, Camera) {
         Vec3::new(s, s, s),
         Vec3::new(s, -s, s),
         Vec3::new(-1.0, 0.0, 0.0),
+        green,
     );
     add_mesh_entity(&mut scene, right, MaterialComponent::new(
         Vec4::new(0.12, 0.45, 0.15, 1.0), 0.1, 0.9,
@@ -86,8 +95,9 @@ pub fn build_scene() -> (Scene, Camera) {
 
     // --- Tall box (left side) ---
     let tall_box = create_box(
-        Vec3::new(-150.0, -s, -100.0),  // center bottom-front-left
-        Vec3::new(80.0, 300.0, 80.0),   // half-extents
+        Vec3::new(-150.0, -s, -100.0),
+        Vec3::new(80.0, 300.0, 80.0),
+        white,
     );
     add_mesh_entity(&mut scene, tall_box, MaterialComponent::new(
         Vec4::new(0.73, 0.73, 0.73, 1.0), 0.1, 0.9,
@@ -97,6 +107,7 @@ pub fn build_scene() -> (Scene, Camera) {
     let short_box = create_box(
         Vec3::new(150.0, -s, 50.0),
         Vec3::new(80.0, 150.0, 80.0),
+        white,
     );
     add_mesh_entity(&mut scene, short_box, MaterialComponent::new(
         Vec4::new(0.73, 0.73, 0.73, 1.0), 0.1, 0.9,
@@ -120,19 +131,20 @@ fn create_box_wall(
     v2: Vec3,
     v3: Vec3,
     normal: Vec3,
+    color: Vec3,
 ) -> MeshComponent {
     let vertices = vec![
-        MeshVertex { position: v0, normal },
-        MeshVertex { position: v1, normal },
-        MeshVertex { position: v2, normal },
-        MeshVertex { position: v3, normal },
+        MeshVertex { position: v0, normal, color },
+        MeshVertex { position: v1, normal, color },
+        MeshVertex { position: v2, normal, color },
+        MeshVertex { position: v3, normal, color },
     ];
     let indices = vec![0, 1, 2, 0, 2, 3];
     MeshComponent::new(vertices, indices)
 }
 
 /// Create a 3D box mesh centered at `center` with half-extents `half`.
-fn create_box(center: Vec3, half: Vec3) -> MeshComponent {
+fn create_box(center: Vec3, half: Vec3, color: Vec3) -> MeshComponent {
     let cx = center.x;
     let cy = center.y;
     let cz = center.z;
@@ -173,6 +185,7 @@ fn create_box(center: Vec3, half: Vec3) -> MeshComponent {
             vertices.push(MeshVertex {
                 position: v[face * 4 + i],
                 normal: normals[face],
+                color,
             });
         }
     }

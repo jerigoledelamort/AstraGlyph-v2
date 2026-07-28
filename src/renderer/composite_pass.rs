@@ -4,7 +4,7 @@
 use crate::ascii::{build_atlas, glyph_count, GLYPH_SIZE};
 use crate::engine::core::{cast_slice, Pod, Result};
 use crate::graphics::pipeline;
-use wgpu::{Device, Queue, SurfaceTexture, TextureFormat};
+use wgpu::{Device, Queue, TextureFormat};
 
 /// Per-cell instance data sent to the GPU as a storage buffer.
 #[repr(C)]
@@ -33,7 +33,7 @@ pub struct CompositePipeline {
 }
 
 impl CompositePipeline {
-    pub fn new(device: &Device, screen_format: TextureFormat) -> Result<Self> {
+pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) -> Result<Self> {
         let glyph_count_val = glyph_count() as u32;
         let atlas_width = glyph_count_val * GLYPH_SIZE;
 
@@ -68,9 +68,7 @@ impl CompositePipeline {
             ..Default::default()
         });
 
-        // Instance buffer (sized for a maximum number of cells).
-        // We'll use 80*48 = 3840 as a reasonable default.
-        let max_instances = 80 * 48;
+        // Instance buffer (sized for the actual number of cells).
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),
             size: (max_instances as u64) * std::mem::size_of::<InstanceData>() as u64,

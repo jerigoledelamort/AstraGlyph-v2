@@ -1,7 +1,6 @@
 // Composite pass: vertex shader — renders ASCII glyphs as textured quads.
 // Uses storage buffer with per-instance data (position, uv offset, color).
-// Quad is defined as a unit square [0,1]x[0,1] with the glyph atlas as a
-// texture array — each glyph index maps to a layer.
+// Each glyph is a horizontal slice of the atlas texture.
 
 struct InstanceData {
     ndc_x: f32,
@@ -41,6 +40,9 @@ const QUAD_UVS = array<vec2<f32>, 6>(
     vec2<f32>(1.0, 1.0),
 );
 
+// Atlas layout: 14 glyphs in a single row, each 8px wide.
+const GLYPHS_PER_ROW: f32 = 14.0;
+
 @vertex
 fn main(
     @builtin(vertex_index) vertex_id: u32,
@@ -53,9 +55,15 @@ fn main(
     let x = data.ndc_x + local.x * data.width;
     let y = data.ndc_y - local.y * data.height; // y goes down, ndc_y is top
 
+    // Map UV [0,1] to the glyph's slice in the atlas row.
+    let glyph_start = f32(data.glyph_index) / GLYPHS_PER_ROW;
+    let glyph_size = 1.0 / GLYPHS_PER_ROW;
+    let base_uv = QUAD_UVS[vertex_id];
+    let atlas_uv = vec2<f32>(glyph_start + base_uv.x * glyph_size, base_uv.y);
+
     var output: VertexOutput;
     output.clip_pos = vec4<f32>(x, y, 0.0, 1.0);
-    output.uv = QUAD_UVS[vertex_id];
+    output.uv = atlas_uv;
     output.color = vec3<f32>(data.color_r, data.color_g, data.color_b);
     return output;
 }

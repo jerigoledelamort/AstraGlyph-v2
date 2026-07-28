@@ -98,7 +98,7 @@ mod tests {
             Vec3::UNIT_Y,
             Projection::perspective(radians(60.0), 16.0 / 9.0, 0.1, 100.0),
         );
-        let vp = cam.view_projection();
+        let _vp = cam.view_projection();
         // The camera position should map to the origin in view space.
         let view = cam.view_matrix();
         let origin_in_view = view.transform_point(cam.position);

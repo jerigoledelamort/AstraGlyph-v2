@@ -121,6 +121,11 @@ impl ScenePipeline {
                     wgpu::VertexFormat::Float32x3,
                     std::mem::size_of::<f32>() as u64 * 3,
                 ),
+                pipeline::vertex_attr(
+                    2,
+                    wgpu::VertexFormat::Float32x3,
+                    std::mem::size_of::<f32>() as u64 * 6,
+                ),
             ],
         };
 

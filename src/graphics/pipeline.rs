@@ -1,6 +1,5 @@
 // Pipeline and shader module utilities.
 
-use crate::engine::core::{EngineError, Result};
 use wgpu::Device;
 
 /// Compile a WGSL shader source into a ShaderModule.
@@ -31,7 +30,7 @@ pub fn vertex_attr(location: u32, format: wgpu::VertexFormat, offset: u64) -> wg
 #[allow(dead_code)]
 pub fn render_pipeline(
     device: &Device,
-    label: &str,
+_label: &str,
     desc: &wgpu::RenderPipelineDescriptor,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(desc)

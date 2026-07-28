@@ -5,8 +5,8 @@ use std::time::Instant;
 use crate::engine::core::Result;
 use crate::engine::math::{radians, Vec3};
 use crate::graphics::GraphicsContext;
-use crate::renderer::{AsciiProcessor, CompositePipeline, InstanceData, LightUniform, ScenePipeline};
-use crate::scene::{Camera, MeshComponent, Projection, Scene};
+use crate::renderer::{AsciiProcessor, CompositePipeline, LightUniform, ScenePipeline};
+use crate::scene::{Camera, MeshComponent, Scene};
 use crate::demo::cornell_box;
 
 use super::input::InputState;
@@ -38,7 +38,7 @@ impl CameraController {
         // Mouse look (only when LMB is held).
         if input.is_look_active() {
             let (dx, dy) = input.take_mouse_delta();
-            self.yaw -= dx as f32 * self.look_sensitivity;
+            self.yaw += dx as f32 * self.look_sensitivity;
             self.pitch -= dy as f32 * self.look_sensitivity;
             // Clamp pitch to avoid flipping.
             self.pitch = self.pitch.clamp(-radians(89.0), radians(89.0));
@@ -54,9 +54,9 @@ impl CameraController {
             -self.yaw.sin() * self.pitch.cos(),
         );
         let right = Vec3::new(
-            -self.yaw.sin(),
+            self.yaw.sin(),
             0.0,
-            -self.yaw.cos(),
+            self.yaw.cos(),
         );
 
         // WASD movement.
@@ -77,7 +77,7 @@ impl CameraController {
         if input.is_key_pressed(winit::keyboard::KeyCode::Space) {
             move_dir += Vec3::UNIT_Y;
         }
-        if input.is_key_pressed(winit::keyboard::KeyCode::ShiftLeft) {
+        if input.is_key_pressed(winit::keyboard::KeyCode::ControlLeft) {
             move_dir -= Vec3::UNIT_Y;
         }
 
@@ -134,6 +134,7 @@ impl AppState {
         let composite_pipeline = CompositePipeline::new(
             &graphics.device,
             graphics.config.format,
+            grid_cols * grid_rows,
         )?;
         composite_pipeline.upload_atlas(&graphics.queue);
 

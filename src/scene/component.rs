@@ -49,6 +49,7 @@ impl Component for MeshComponent {}
 pub struct MeshVertex {
     pub position: Vec3,
     pub normal: Vec3,
+    pub color: Vec3,
 }
 
 unsafe impl crate::engine::core::Pod for MeshVertex {}

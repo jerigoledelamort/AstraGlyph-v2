@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 use std::any::TypeId;
-use crate::engine::core::Result;
-
 use super::component::Component;
 use super::entity::Entity;
 
@@ -155,7 +153,7 @@ mod tests {
     fn entities_with_filter() {
         let mut scene = Scene::new();
         let a = scene.create_entity();
-        let b = scene.create_entity();
+        let _b = scene.create_entity();
         let c = scene.create_entity();
 
         scene.add_component(a, Health { hp: 10.0 });

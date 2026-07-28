@@ -131,8 +131,8 @@ impl AsciiProcessor {
     pub fn pixels_to_instances(
         &self,
         pixels: &[[u8; 4]],
-        screen_w: u32,
-        screen_h: u32,
+        _screen_w: u32,
+        _screen_h: u32,
     ) -> Vec<InstanceData> {
         let cols = self.width;
         let rows = self.height;
