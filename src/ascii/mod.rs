@@ -2,6 +2,7 @@
 // colour modes, UI overlay.
 
 pub mod blocks;
+pub mod box_drawing;
 pub mod cell_grid;
 pub mod color;
 pub mod font5x7;
@@ -25,6 +26,7 @@ pub use color::{luminance, quantize_buffer, ColorMode};
 //                                             so brightness->index still works)
 //   [FONT_GLYPH_OFFSET .. +CHAR_COUNT)        printable ASCII text font
 //   [BLOCK_GLYPH_OFFSET .. +BLOCK_COUNT)      quadrant block elements
+//   [BOX_GLYPH_OFFSET .. +BOX_COUNT)          box drawing + arrows
 
 /// Atlas index of the first font glyph (i.e. of `font5x7::FIRST_CHAR`).
 pub const FONT_GLYPH_OFFSET: u32 = 14;
@@ -32,18 +34,27 @@ pub const FONT_GLYPH_OFFSET: u32 = 14;
 /// Atlas index of the first block-element glyph (quadrant pattern 0).
 pub const BLOCK_GLYPH_OFFSET: u32 = FONT_GLYPH_OFFSET + font5x7::CHAR_COUNT as u32;
 
+/// Atlas index of the first box-drawing glyph.
+pub const BOX_GLYPH_OFFSET: u32 = BLOCK_GLYPH_OFFSET + blocks::BLOCK_COUNT as u32;
+
 /// Total glyphs in the combined atlas.
 pub fn combined_glyph_count() -> usize {
-    glyph_count() + font5x7::CHAR_COUNT + blocks::BLOCK_COUNT
+    glyph_count() + font5x7::CHAR_COUNT + blocks::BLOCK_COUNT + box_drawing::BOX_COUNT
 }
 
-/// Build the combined atlas: shading glyphs, then the text font, then the block
-/// elements, in the same flat RGBA layout `build_atlas()` uses.
+/// Build the combined atlas: shading glyphs, the text font, the block elements,
+/// then box drawing — in the same flat RGBA layout `build_atlas()` uses.
 pub fn build_combined_atlas() -> Vec<u8> {
     let mut atlas = build_atlas();
     atlas.extend_from_slice(&font5x7::build_font_atlas());
     atlas.extend_from_slice(&blocks::build_block_atlas());
+    atlas.extend_from_slice(&box_drawing::build_box_atlas());
     atlas
+}
+
+/// Atlas index for a box-drawing character, or `None` if it is not one.
+pub fn box_glyph_index(c: char) -> Option<u32> {
+    box_drawing::box_index(c).map(|i| BOX_GLYPH_OFFSET + i as u32)
 }
 
 /// Atlas index for a 4-bit quadrant pattern.
@@ -93,10 +104,19 @@ pub fn text_glyph_index(c: char) -> Option<u32> {
 
 /// `char -> glyph index` mapping for [`Overlay`], usable as its `GlyphMapFn`.
 ///
-/// Unsupported characters fall back to the space glyph rather than to a shading
-/// block, so an unexpected character leaves a gap instead of a bright artefact.
+/// Resolves printable ASCII through the text font and box-drawing/arrow
+/// characters through their own section, so UI code can write '┌' and '▲'
+/// literally. Anything else falls back to the space glyph rather than to a
+/// shading block, so an unexpected character leaves a gap instead of a bright
+/// artefact in the middle of a panel.
 pub fn overlay_glyph_of(c: char) -> u32 {
-    text_glyph_index(c).unwrap_or(glyph_atlas::SPACE_INDEX)
+    if let Some(index) = text_glyph_index(c) {
+        return index;
+    }
+    if let Some(index) = box_glyph_index(c) {
+        return index;
+    }
+    glyph_atlas::SPACE_INDEX
 }
 
 #[cfg(test)]
@@ -112,11 +132,11 @@ mod tests {
     }
 
     #[test]
-    fn combined_atlas_has_all_three_sections() {
+    fn combined_atlas_has_all_sections() {
         let atlas = build_combined_atlas();
         assert_eq!(
             combined_glyph_count(),
-            glyph_count() + font5x7::CHAR_COUNT + blocks::BLOCK_COUNT
+            glyph_count() + font5x7::CHAR_COUNT + blocks::BLOCK_COUNT + box_drawing::BOX_COUNT
         );
         assert_eq!(atlas.len(), combined_glyph_count() * GLYPH_BYTES * 4);
 
@@ -137,11 +157,37 @@ mod tests {
     }
 
     #[test]
-    fn the_block_section_bytes_match_the_block_atlas() {
+    fn the_block_and_box_sections_match_their_atlases() {
         let atlas = build_combined_atlas();
+
         let blocks_bytes = blocks::build_block_atlas();
-        let offset = (BLOCK_GLYPH_OFFSET as usize) * GLYPH_BYTES * 4;
-        assert_eq!(&atlas[offset..], &blocks_bytes[..]);
+        let block_offset = (BLOCK_GLYPH_OFFSET as usize) * GLYPH_BYTES * 4;
+        assert_eq!(
+            &atlas[block_offset..block_offset + blocks_bytes.len()],
+            &blocks_bytes[..]
+        );
+
+        let box_bytes = box_drawing::build_box_atlas();
+        let box_offset = (BOX_GLYPH_OFFSET as usize) * GLYPH_BYTES * 4;
+        assert_eq!(&atlas[box_offset..], &box_bytes[..], "box section must end the atlas");
+    }
+
+    #[test]
+    fn box_glyph_indices_land_inside_the_box_section() {
+        assert_eq!(
+            BOX_GLYPH_OFFSET as usize,
+            glyph_count() + font5x7::CHAR_COUNT + blocks::BLOCK_COUNT
+        );
+        let corner = box_glyph_index('┌').expect("box chars must resolve");
+        assert!(corner >= BOX_GLYPH_OFFSET);
+        assert!((corner as usize) < combined_glyph_count());
+        assert_eq!(box_glyph_index('A'), None, "letters belong to the font section");
+
+        // The overlay map must reach both sections, since UI code writes text and
+        // frame characters side by side.
+        assert_eq!(overlay_glyph_of('┌'), corner);
+        assert_eq!(overlay_glyph_of('A'), text_glyph_index('A').unwrap());
+        assert_eq!(overlay_glyph_of('▲'), box_glyph_index('▲').unwrap());
     }
 
     #[test]

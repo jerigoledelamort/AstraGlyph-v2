@@ -377,20 +377,32 @@ impl Overlay {
         let last_col = col.saturating_add(w - 1);
         let last_row = row.saturating_add(h - 1);
 
-        let corner = OverlayCell::new(self.glyph_index_of('+'), color);
-        let horizontal = OverlayCell::new(self.glyph_index_of('-'), color);
-        let vertical = OverlayCell::new(self.glyph_index_of(':'), color);
+        // Real box-drawing characters: each corner is a distinct glyph, so the
+        // frame closes properly instead of showing the gaps that '+'/'-'/':'
+        // substitutes leave. A glyph map without them falls back through
+        // `glyph_index_of`, so this stays correct on a minimal atlas too.
+        let horizontal = OverlayCell::new(self.glyph_index_of('─'), color);
+        let vertical = OverlayCell::new(self.glyph_index_of('│'), color);
+        let top_left = OverlayCell::new(self.glyph_index_of('┌'), color);
+        let top_right = OverlayCell::new(self.glyph_index_of('┐'), color);
+        let bottom_left = OverlayCell::new(self.glyph_index_of('└'), color);
+        let bottom_right = OverlayCell::new(self.glyph_index_of('┘'), color);
 
         for y in y0..y1 {
-            let on_h_edge = y == row || y == last_row;
+            let on_top = y == row;
+            let on_bottom = y == last_row;
             for x in x0..x1 {
-                let on_v_edge = x == col || x == last_col;
-                let cell = match (on_h_edge, on_v_edge) {
-                    (true, true) => corner,
-                    (true, false) => horizontal,
-                    (false, true) => vertical,
+                let on_left = x == col;
+                let on_right = x == last_col;
+                let cell = match (on_top, on_bottom, on_left, on_right) {
+                    (true, _, true, _) => top_left,
+                    (true, _, _, true) => top_right,
+                    (_, true, true, _) => bottom_left,
+                    (_, true, _, true) => bottom_right,
+                    (true, _, _, _) | (_, true, _, _) => horizontal,
+                    (_, _, true, _) | (_, _, _, true) => vertical,
                     // Interior: not part of the border, leave untouched.
-                    (false, false) => continue,
+                    _ => continue,
                 };
                 self.set_cell(x, y, cell);
             }
@@ -687,15 +699,20 @@ mod tests {
         let mut overlay = Overlay::new(6, 5);
         overlay.draw_box(0, 0, 4, 3, RED);
 
-        let corner = default_glyph_of('+');
-        let horizontal = default_glyph_of('-');
-        let vertical = default_glyph_of(':');
+        let horizontal = default_glyph_of('─');
+        let vertical = default_glyph_of('│');
 
-        // Corners.
-        for (col, row) in [(0, 0), (3, 0), (0, 2), (3, 2)] {
+        // Corners: each is its own glyph now, so the frame closes cleanly instead
+        // of showing the gaps a shared '+' left.
+        for (col, row, corner_char) in [
+            (0u32, 0u32, '┌'),
+            (3, 0, '┐'),
+            (0, 2, '└'),
+            (3, 2, '┘'),
+        ] {
             let cell = overlay.cell(col, row).unwrap();
             assert!(cell.opaque, "corner ({col},{row}) missing");
-            assert_eq!(cell.glyph_index, corner, "corner ({col},{row})");
+            assert_eq!(cell.glyph_index, default_glyph_of(corner_char), "corner ({col},{row})");
             assert_eq!(cell.color, RED);
         }
         // Horizontal edges.
@@ -723,30 +740,33 @@ mod tests {
 
     #[test]
     fn draw_box_degenerate_sizes() {
-        let corner = default_glyph_of('+');
-        let horizontal = default_glyph_of('-');
-        let vertical = default_glyph_of(':');
+        let horizontal = default_glyph_of('─');
+        let vertical = default_glyph_of('│');
+        let top_left = default_glyph_of('┌');
+        let top_right = default_glyph_of('┐');
+        let bottom_left = default_glyph_of('└');
 
-        // 1x1 -> a single corner glyph.
+        // 1x1 -> a single cell that is both top and left, so it takes the
+        // top-left corner.
         let mut overlay = Overlay::new(4, 4);
         overlay.draw_box(1, 1, 1, 1, WHITE);
         assert_eq!(overlay.cells().iter().filter(|c| c.opaque).count(), 1);
-        assert_eq!(overlay.cell(1, 1).unwrap().glyph_index, corner);
+        assert_eq!(overlay.cell(1, 1).unwrap().glyph_index, top_left);
 
         // 1x3 -> vertical line capped with corners.
         let mut overlay = Overlay::new(4, 4);
         overlay.draw_box(0, 0, 1, 3, WHITE);
-        assert_eq!(overlay.cell(0, 0).unwrap().glyph_index, corner);
+        assert_eq!(overlay.cell(0, 0).unwrap().glyph_index, top_left);
         assert_eq!(overlay.cell(0, 1).unwrap().glyph_index, vertical);
-        assert_eq!(overlay.cell(0, 2).unwrap().glyph_index, corner);
+        assert_eq!(overlay.cell(0, 2).unwrap().glyph_index, bottom_left);
         assert_eq!(overlay.cells().iter().filter(|c| c.opaque).count(), 3);
 
         // 3x1 -> horizontal line capped with corners.
         let mut overlay = Overlay::new(4, 4);
         overlay.draw_box(0, 0, 3, 1, WHITE);
-        assert_eq!(overlay.cell(0, 0).unwrap().glyph_index, corner);
+        assert_eq!(overlay.cell(0, 0).unwrap().glyph_index, top_left);
         assert_eq!(overlay.cell(1, 0).unwrap().glyph_index, horizontal);
-        assert_eq!(overlay.cell(2, 0).unwrap().glyph_index, corner);
+        assert_eq!(overlay.cell(2, 0).unwrap().glyph_index, top_right);
         assert_eq!(overlay.cells().iter().filter(|c| c.opaque).count(), 3);
     }
 
@@ -756,10 +776,9 @@ mod tests {
         // must NOT turn visible cells into corners.
         let mut overlay = Overlay::new(3, 3);
         overlay.draw_box(0, 0, 10, 10, WHITE);
-        let corner = default_glyph_of('+');
-        let horizontal = default_glyph_of('-');
-        let vertical = default_glyph_of(':');
-        assert_eq!(overlay.cell(0, 0).unwrap().glyph_index, corner);
+        let horizontal = default_glyph_of('─');
+        let vertical = default_glyph_of('│');
+        assert_eq!(overlay.cell(0, 0).unwrap().glyph_index, default_glyph_of('┌'));
         assert_eq!(overlay.cell(1, 0).unwrap().glyph_index, horizontal);
         assert_eq!(overlay.cell(2, 0).unwrap().glyph_index, horizontal);
         assert_eq!(overlay.cell(0, 1).unwrap().glyph_index, vertical);
