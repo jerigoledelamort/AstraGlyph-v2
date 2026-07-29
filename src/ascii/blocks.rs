@@ -110,6 +110,14 @@ pub struct BlockCell {
     pub pattern: u8,
     /// Colour for the filled quadrants.
     pub color: [f32; 3],
+    /// Colour for the EMPTY quadrants.
+    ///
+    /// A quadrant glyph only covers part of its cell, so the remainder needs a
+    /// colour too — otherwise it shows whatever the target was cleared to
+    /// (black), and every cell straddling a gradient punches a dark hole into the
+    /// image. Filling it with the mean of the unlit subpixels is what makes the
+    /// result read as a continuous 2x-resolution image.
+    pub background: [f32; 3],
     /// True when the cell had no meaningful internal contrast, so the pattern
     /// was chosen as "all four" and the colour carries the whole tone. Callers
     /// that prefer a shading-ramp glyph for flat areas can branch on this.
@@ -157,9 +165,13 @@ pub fn classify(sub: &Subpixels) -> BlockCell {
     // colour carry the tone — with true colour that is the most faithful
     // representation available, and it cannot flicker.
     if !(max - min > FLAT_EPSILON) {
+        let mean = average(&[sub[0], sub[1], sub[2], sub[3]]);
         return BlockCell {
             pattern: 0b1111,
-            color: average(&[sub[0], sub[1], sub[2], sub[3]]),
+            color: mean,
+            // Fully covered, so the background is never sampled; keeping it equal
+            // to the foreground means a stray mask value can't darken the cell.
+            background: mean,
             flat: true,
         };
     }
@@ -168,21 +180,28 @@ pub fn classify(sub: &Subpixels) -> BlockCell {
     let bits = [UL, UR, LL, LR];
     let mut pattern = 0u8;
     let mut filled: Vec<[f32; 3]> = Vec::with_capacity(4);
+    let mut empty: Vec<[f32; 3]> = Vec::with_capacity(4);
     for i in 0..4 {
         let l = if lum[i].is_finite() { lum[i] } else { 0.0 };
         if l >= threshold {
             pattern |= bits[i];
             filled.push(sub[i]);
+        } else {
+            empty.push(sub[i]);
         }
     }
 
     // `max` is above the threshold by construction, so at least one quadrant is
-    // always filled and `filled` is never empty.
-    BlockCell {
-        pattern,
-        color: average(&filled),
-        flat: false,
-    }
+    // always filled and `filled` is never empty. `empty` can be empty, in which
+    // case the background is unused and mirrors the foreground.
+    let color = average(&filled);
+    let background = if empty.is_empty() {
+        color
+    } else {
+        average(&empty)
+    };
+
+    BlockCell { pattern, color, background, flat: false }
 }
 
 fn average(colors: &[[f32; 3]]) -> [f32; 3] {
@@ -376,6 +395,46 @@ mod tests {
         let cell = classify(&[bright, dark, dark, bright]);
         assert_eq!(cell.pattern, UL | LR);
         assert_eq!(BLOCK_CHARS[cell.pattern as usize], '▚');
+    }
+
+    /// The regression this guards: a partially covered cell must supply a colour
+    /// for its EMPTY quadrants too. When it did not, every cell straddling a
+    /// gradient rendered its uncovered part as the cleared background, which
+    /// showed up as black streaks across smooth surfaces like the ground plane.
+    #[test]
+    fn partial_cells_carry_a_background_from_the_unlit_subpixels() {
+        let bright = [0.8, 0.8, 0.8];
+        let dim = [0.2, 0.2, 0.2];
+        let cell = classify(&[bright, bright, dim, dim]);
+
+        assert_eq!(cell.pattern, UL | UR);
+        // Foreground from the lit half...
+        for c in cell.color {
+            assert!((c - 0.8).abs() < 1e-6, "foreground {:?}", cell.color);
+        }
+        // ...and background from the unlit half, NOT black.
+        for c in cell.background {
+            assert!((c - 0.2).abs() < 1e-6, "background {:?}", cell.background);
+        }
+        assert_ne!(cell.background, [0.0, 0.0, 0.0], "background must not be a black hole");
+    }
+
+    #[test]
+    fn background_matches_foreground_when_every_quadrant_is_lit() {
+        // Flat cell: fully covered, so the background is never sampled. Keeping it
+        // equal to the foreground means a stray mask value cannot darken the cell.
+        let cell = classify(&[[0.5; 3], [0.5; 3], [0.5; 3], [0.5; 3]]);
+        assert_eq!(cell.pattern, 0b1111);
+        assert_eq!(cell.color, cell.background);
+    }
+
+    #[test]
+    fn background_is_finite_for_hostile_input() {
+        let nan = [f32::NAN; 3];
+        for s in [[nan, [1.0; 3], nan, [0.0; 3]], [nan, nan, nan, nan]] {
+            let cell = classify(&s);
+            assert!(cell.background.iter().all(|c| c.is_finite()), "{cell:?}");
+        }
     }
 
     #[test]

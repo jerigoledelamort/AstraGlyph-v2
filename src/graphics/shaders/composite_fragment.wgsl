@@ -12,10 +12,14 @@ struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) bg: vec3<f32>,
 };
 
 @fragment
 fn main(input: VertexOutput) -> @location(0) vec4<f32> {
     let glyph_mask = textureSample(glyph_atlas, glyph_sampler, input.uv).r;
-    return vec4<f32>(input.color * glyph_mask, 1.0);
+    // The mask selects between the cell's two colours instead of fading the
+    // foreground to black. A quadrant block covering half a cell then shows the
+    // darker half-tone in the other half, rather than a black gap.
+    return vec4<f32>(mix(input.bg, input.color, glyph_mask), 1.0);
 }

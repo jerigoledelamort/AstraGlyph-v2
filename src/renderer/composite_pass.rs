@@ -7,6 +7,12 @@ use crate::graphics::pipeline;
 use wgpu::{Device, Queue, TextureFormat};
 
 /// Per-cell instance data sent to the GPU as a storage buffer.
+///
+/// A cell carries TWO colours. The glyph's coverage mask selects between them,
+/// so the parts of the cell the glyph does not cover are filled with `bg_*`
+/// rather than left showing the cleared background. Without that, any partially
+/// covered glyph punches black holes into the image — which is exactly what a
+/// quadrant block does on every cell that straddles a gradient.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InstanceData {
@@ -15,9 +21,14 @@ pub struct InstanceData {
     pub width: f32,
     pub height: f32,
     pub glyph_index: u32,
+    /// Colour where the glyph is opaque.
     pub color_r: f32,
     pub color_g: f32,
     pub color_b: f32,
+    /// Colour where the glyph is empty.
+    pub bg_r: f32,
+    pub bg_g: f32,
+    pub bg_b: f32,
 }
 
 unsafe impl Pod for InstanceData {}

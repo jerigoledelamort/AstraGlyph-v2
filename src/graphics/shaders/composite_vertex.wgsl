@@ -11,6 +11,9 @@ struct InstanceData {
     color_r: f32,
     color_g: f32,
     color_b: f32,
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
 };
 
 @group(0) @binding(0) var<storage, read> instances: array<InstanceData>;
@@ -24,6 +27,7 @@ struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) bg: vec3<f32>,
 };
 
 // 6 vertices for a quad (two triangles)
@@ -72,5 +76,6 @@ fn main(
     output.clip_pos = vec4<f32>(x, y, 0.0, 1.0);
     output.uv = atlas_uv;
     output.color = vec3<f32>(data.color_r, data.color_g, data.color_b);
+    output.bg = vec3<f32>(data.bg_r, data.bg_g, data.bg_b);
     return output;
 }

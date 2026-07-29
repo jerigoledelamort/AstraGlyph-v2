@@ -353,17 +353,7 @@ impl AsciiProcessor {
                     pixels, self.width, self.height, col, row,
                 );
 
-                let (glyph_index, color) = match style {
-                    GlyphStyle::Blocks => {
-                        let cell = crate::ascii::blocks::classify(&sub);
-                        (crate::ascii::block_glyph_index(cell.pattern), cell.color)
-                    }
-                    GlyphStyle::Ramp => {
-                        let avg = crate::ascii::blocks::average_subpixels(&sub);
-                        let lum = crate::ascii::luminance(avg);
-                        (crate::ascii::glyph_atlas::brightness_to_index(lum), avg)
-                    }
-                };
+                let (glyph_index, color, background) = self.style_glyph(&sub, style);
 
                 instances.push(InstanceData {
                     ndc_x: -1.0 + col as f32 * cell_w_ndc,
@@ -374,6 +364,9 @@ impl AsciiProcessor {
                     color_r: color[0],
                     color_g: color[1],
                     color_b: color[2],
+                    bg_r: background[0],
+                    bg_g: background[1],
+                    bg_b: background[2],
                 });
             }
         }
@@ -404,7 +397,7 @@ impl AsciiProcessor {
         let mut instances = Vec::with_capacity(tiles.len());
 
         for tile in tiles {
-            let (glyph_index, color) = if tile.span == 1 {
+            let (glyph_index, color, background) = if tile.span == 1 {
                 let sub = crate::ascii::blocks::gather_subpixels(
                     pixels, self.width, self.height, tile.col, tile.row,
                 );
@@ -412,10 +405,13 @@ impl AsciiProcessor {
             } else {
                 let avg = self.average_tile(pixels, tile);
                 match style {
-                    GlyphStyle::Blocks => (crate::ascii::block_glyph_index(0b1111), avg),
+                    // A merged tile is drawn solid, so foreground and background
+                    // coincide.
+                    GlyphStyle::Blocks => (crate::ascii::block_glyph_index(0b1111), avg, avg),
                     GlyphStyle::Ramp => (
                         crate::ascii::glyph_atlas::brightness_to_index(crate::ascii::luminance(avg)),
                         avg,
+                        [0.0, 0.0, 0.0],
                     ),
                 }
             };
@@ -430,27 +426,41 @@ impl AsciiProcessor {
                 color_r: color[0],
                 color_g: color[1],
                 color_b: color[2],
+                bg_r: background[0],
+                bg_g: background[1],
+                bg_b: background[2],
             });
         }
 
         instances
     }
 
-    /// Glyph index and colour for one cell's 2x2 subpixel block.
+    /// Glyph index, foreground and background colour for one cell's 2x2 block.
     fn style_glyph(
         &self,
         sub: &crate::ascii::blocks::Subpixels,
         style: GlyphStyle,
-    ) -> (u32, [f32; 3]) {
+    ) -> (u32, [f32; 3], [f32; 3]) {
         match style {
             GlyphStyle::Blocks => {
                 let cell = crate::ascii::blocks::classify(sub);
-                (crate::ascii::block_glyph_index(cell.pattern), cell.color)
+                (
+                    crate::ascii::block_glyph_index(cell.pattern),
+                    cell.color,
+                    cell.background,
+                )
             }
             GlyphStyle::Ramp => {
+                // The ramp deliberately draws against black: its glyphs are a
+                // dither pattern whose visible coverage IS the tone, so filling
+                // the gaps would flatten the whole effect.
                 let avg = crate::ascii::blocks::average_subpixels(sub);
                 let lum = crate::ascii::luminance(avg);
-                (crate::ascii::glyph_atlas::brightness_to_index(lum), avg)
+                (
+                    crate::ascii::glyph_atlas::brightness_to_index(lum),
+                    avg,
+                    [0.0, 0.0, 0.0],
+                )
             }
         }
     }
@@ -517,6 +527,10 @@ impl AsciiProcessor {
                     width: cell_w_ndc,
                     height: cell_h_ndc,
                     glyph_index: cell.glyph_index,
+                    // UI text sits on black so it stays legible over any scene.
+                    bg_r: 0.0,
+                    bg_g: 0.0,
+                    bg_b: 0.0,
                     color_r: cell.color[0],
                     color_g: cell.color[1],
                     color_b: cell.color[2],

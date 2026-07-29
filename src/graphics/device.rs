@@ -84,7 +84,10 @@ impl GraphicsContext {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            // No vsync: the engine is a rendering testbed, so an uncapped frame
+            // rate is the useful default — it makes the cost of a change visible
+            // instead of hiding it behind the refresh interval.
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
