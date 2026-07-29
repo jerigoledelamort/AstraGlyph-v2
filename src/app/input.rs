@@ -15,6 +15,12 @@ pub struct InputState {
     mouse_delta: (f64, f64),
     /// Mouse wheel delta.
     mouse_wheel: f32,
+    /// Characters typed since the last frame, in order.
+    ///
+    /// Kept separate from `pressed_keys` because text entry needs the LOGICAL
+    /// character (respecting layout, shift and dead keys), while movement needs
+    /// the physical key position. The console consumes this; the camera does not.
+    typed: String,
 }
 
 impl InputState {
@@ -55,6 +61,27 @@ impl InputState {
     /// Record mouse wheel scroll.
     pub fn mouse_wheel(&mut self, delta: f32) {
         self.mouse_wheel += delta;
+    }
+
+    /// Record text produced by a key press. Control characters are dropped here
+    /// so consumers never have to filter them.
+    pub fn text_input(&mut self, text: &str) {
+        for c in text.chars() {
+            if !c.is_control() {
+                self.typed.push(c);
+            }
+        }
+    }
+
+    /// Consume the characters typed since the last call.
+    pub fn take_typed(&mut self) -> String {
+        std::mem::take(&mut self.typed)
+    }
+
+    /// Drop any pending text without consuming it as input — used when focus
+    /// moves so stale keystrokes do not appear in a newly opened field.
+    pub fn clear_typed(&mut self) {
+        self.typed.clear();
     }
 
     /// Check if a key is currently pressed.
@@ -111,6 +138,28 @@ mod tests {
         // After taking, should be reset.
         let delta2 = input.take_mouse_delta();
         assert_eq!(delta2, (0.0, 0.0));
+    }
+
+    #[test]
+    fn typed_text_accumulates_and_drops_control_characters() {
+        let mut input = InputState::new();
+        assert_eq!(input.take_typed(), "");
+        input.text_input("he");
+        input.text_input("llo");
+        // Control characters (Enter, Tab, Backspace) must not reach the console as
+        // text — they arrive as key codes and mean actions, not content.
+        input.text_input("\r\n\t\u{8}");
+        input.text_input("!");
+        assert_eq!(input.take_typed(), "hello!");
+        assert_eq!(input.take_typed(), "", "taking must drain the buffer");
+    }
+
+    #[test]
+    fn clear_typed_discards_pending_text() {
+        let mut input = InputState::new();
+        input.text_input("stale");
+        input.clear_typed();
+        assert_eq!(input.take_typed(), "");
     }
 
     #[test]

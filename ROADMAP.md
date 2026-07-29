@@ -71,7 +71,9 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 - [x] Block Elements (U+2580–U+259F) with 2x supersampling: each cell resolves a
       2x2 subpixel block into a quadrant glyph, doubling effective resolution
       (toggle: B switches to the classic brightness ramp)
-- [ ] Extended Unicode set (CJK characters, emojis for fun)
+- [x] Box Drawing set (U+2500–U+257F) + geometric arrows, for UI frames
+- [ ] CJK / emoji — needs a larger glyph cell (8x8 cannot hold a legible
+      ideograph), so it waits on a second atlas geometry
 - [x] Color modes: ANSI 256, TrueColor (16M), ANSI 16, grayscale (cycle: M)
 - [ ] TTF font loading → bitmap atlas (optional — the procedural font above is
       the primary path, per this item's original "fallback" framing)
@@ -85,8 +87,8 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 ### 3.3 UI Layer
 - [x] 2D ASCII overlay on top of 3D scene (buffer + compositing)
 - [x] HUD elements (FPS counter, debug info, crosshair — toggle: H)
-- [ ] Menu system (text-based menus, buttons, navigation)
-- [ ] Console / debug command line
+- [x] Menu system (buttons, toggles, choices, submenus — Tab)
+- [x] Console / debug command line (history, scrollback, commands — `)
 
 ---
 

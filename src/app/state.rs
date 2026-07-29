@@ -15,6 +15,7 @@ use crate::scene::{
     MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
 };
 use crate::demo::material_spheres;
+use crate::ui::{Console, ConsoleAction, Menu, MenuAction, MenuEvent, MenuItem};
 
 use super::input::InputState;
 use super::metrics::FrameMetrics;
@@ -164,6 +165,52 @@ fn seed_rig_from_camera(camera: &Camera) -> CameraRig {
 /// grid on each axis, giving every cell a 2x2 block of subpixels.
 const SUBSAMPLE: u32 = 2;
 
+/// The settings menu. Item ids are the contract between the menu and
+/// `apply_menu_event`, so they are defined here in one place.
+fn build_menu() -> Menu {
+    Menu::new(
+        "ASTRAGLYPH",
+        vec![
+            MenuItem::button("Resume", "resume"),
+            MenuItem::Separator,
+            MenuItem::choice(
+                "Glyphs",
+                "style",
+                vec!["Blocks".into(), "Ramp".into()],
+                0,
+            ),
+            MenuItem::choice(
+                "Colour",
+                "color",
+                vec!["True".into(), "256".into(), "16".into(), "Grey".into(), "Mono".into()],
+                0,
+            ),
+            MenuItem::toggle("Post FX", "post", false),
+            MenuItem::toggle("Dynamic grid", "grid", false),
+            MenuItem::toggle("HUD", "hud", true),
+            MenuItem::Separator,
+            MenuItem::submenu(
+                "Camera",
+                vec![
+                    MenuItem::button("First person", "cam_first"),
+                    MenuItem::button("Third person", "cam_third"),
+                    MenuItem::button("Orbit", "cam_orbit"),
+                ],
+            ),
+            MenuItem::Separator,
+            MenuItem::button("Quit", "quit"),
+        ],
+    )
+}
+
+/// The debug console, pre-seeded with a hint so it is not an empty black box on
+/// first open.
+fn build_console() -> Console {
+    let mut console = Console::new();
+    console.print("AstraGlyph console. Type 'help' for commands.");
+    console
+}
+
 /// Scene file the demo starts with, resolved relative to the working directory
 /// first (so an edited file is picked up by `cargo run`) and then relative to
 /// the crate root (so it also works when launched from elsewhere).
@@ -249,6 +296,44 @@ pub struct AppState {
     /// Toggled with B.
     glyph_style: GlyphStyle,
     style_key_was_down: bool,
+    /// Settings menu (Tab) and debug console (Backquote). While either is open it
+    /// takes keyboard focus, so the camera does not move underneath it.
+    menu: Menu,
+    console: Console,
+    /// Edge latches for the keys the UI layers consume.
+    ui_keys_down: UiKeyLatches,
+    /// Set by the menu's Quit entry or the console's `quit` command; the event
+    /// loop polls it so shutdown stays the caller's decision.
+    should_exit: bool,
+}
+
+/// Previous state of every key the UI reads, so each press acts once.
+///
+/// A menu that scrolls once per FRAME instead of once per press is unusable, and
+/// this is the whole reason the UI modules take discrete actions rather than
+/// polling key state themselves.
+#[derive(Default)]
+struct UiKeyLatches {
+    menu_toggle: bool,
+    console_toggle: bool,
+    up: bool,
+    down: bool,
+    enter: bool,
+    backspace: bool,
+    delete: bool,
+    left: bool,
+    right: bool,
+    home: bool,
+    end: bool,
+    page_up: bool,
+    page_down: bool,
+}
+
+/// Edge detector: true only on the frame a key transitions to pressed.
+fn pressed_once(down: bool, latch: &mut bool) -> bool {
+    let fired = down && !*latch;
+    *latch = down;
+    fired
 }
 
 impl AppState {
@@ -334,6 +419,10 @@ impl AppState {
             hud_key_was_down: false,
             glyph_style: GlyphStyle::default(),
             style_key_was_down: false,
+            menu: build_menu(),
+            console: build_console(),
+            ui_keys_down: UiKeyLatches::default(),
+            should_exit: false,
         })
     }
 
@@ -351,6 +440,35 @@ impl AppState {
     /// Get a mutable reference to the input state.
     pub fn input_mut(&mut self) -> &mut InputState {
         &mut self.input
+    }
+
+    /// Whether a UI layer currently wants typed characters. `main` uses this to
+    /// decide if a key press should also be forwarded as text.
+    pub fn ui_wants_text(&self) -> bool {
+        self.console.is_open()
+    }
+
+    /// Whether any UI layer holds keyboard focus, in which case the camera must
+    /// not react to movement keys.
+    fn ui_has_focus(&self) -> bool {
+        self.console.is_open() || self.menu.is_open()
+    }
+
+    /// Handle Escape. Returns true if a UI layer consumed it, in which case the
+    /// application must NOT exit.
+    pub fn handle_escape(&mut self) -> bool {
+        if self.console.is_open() {
+            self.console.close();
+            self.input.clear_typed();
+            return true;
+        }
+        if self.menu.is_open() {
+            // Let the menu decide: inside a submenu this steps back out rather
+            // than closing, which is what a user expects from Escape.
+            self.menu.handle(MenuAction::Back);
+            return true;
+        }
+        false
     }
 
     /// Render one frame.
@@ -374,9 +492,20 @@ impl AppState {
         // Begin metrics tracking.
         self.metrics.begin_frame();
 
+        // UI first: an open menu or console owns the keyboard, so the camera must
+        // not also act on the same keys.
+        self.update_ui();
+
         // Drive the camera rig from input, then write its smoothed state into
-        // the camera (its projection is left alone).
-        self.camera_input.update(&mut self.camera_rig, &mut self.input, dt);
+        // the camera (its projection is left alone). While a UI layer has focus
+        // the rig still advances (so smoothing settles) but receives no input.
+        if self.ui_has_focus() {
+            self.input.take_mouse_delta();
+            self.input.take_mouse_wheel();
+            self.camera_rig.update(dt);
+        } else {
+            self.camera_input.update(&mut self.camera_rig, &mut self.input, dt);
+        }
         self.camera_rig.apply_to(&mut self.camera);
 
         // First-person wheel zoom acts on the field of view, clamped to a range
@@ -394,8 +523,13 @@ impl AppState {
             }
         }
 
+        // Single-letter shortcuts are suppressed while a UI layer has focus —
+        // otherwise typing "post" in the console would flip half the settings.
+        let shortcuts_active = !self.ui_has_focus();
+
         // G toggles the dynamic cell grid (edge-triggered).
-        let grid_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyG);
+        let grid_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyG);
         if grid_key_down && !self.grid_key_was_down {
             self.subdivision = if self.subdivision.merges() {
                 SubdivisionPolicy::uniform()
@@ -410,7 +544,8 @@ impl AppState {
         self.grid_key_was_down = grid_key_down;
 
         // M cycles the colour mode (edge-triggered).
-        let color_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyM);
+        let color_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyM);
         if color_key_down && !self.color_key_was_down {
             self.color_mode = next_color_mode(self.color_mode);
             eprintln!("color: mode = {:?}", self.color_mode);
@@ -418,7 +553,8 @@ impl AppState {
         self.color_key_was_down = color_key_down;
 
         // P toggles post-processing (edge-triggered).
-        let post_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyP);
+        let post_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyP);
         if post_key_down && !self.post_key_was_down {
             self.post = if self.post.any_enabled() {
                 PostProcessSettings::none()
@@ -433,14 +569,16 @@ impl AppState {
         self.post_key_was_down = post_key_down;
 
         // H toggles the HUD (edge-triggered).
-        let hud_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyH);
+        let hud_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyH);
         if hud_key_down && !self.hud_key_was_down {
             self.hud_visible = !self.hud_visible;
         }
         self.hud_key_was_down = hud_key_down;
 
         // B switches between block elements and the brightness ramp.
-        let style_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyB);
+        let style_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyB);
         if style_key_down && !self.style_key_was_down {
             self.glyph_style = match self.glyph_style {
                 GlyphStyle::Blocks => GlyphStyle::Ramp,
@@ -607,8 +745,17 @@ impl AppState {
         // Draw the UI layer and append it as extra glyph quads. Appending rather
         // than rewriting scene cells keeps the HUD independent of whether the
         // grid merged any tiles this frame.
-        if self.hud_visible {
-            self.draw_hud();
+        // The overlay is redrawn from scratch each frame: HUD first, then the
+        // menu or console on top of it so a panel covers the stats rather than
+        // fighting them for the same cells.
+        let ui_open = self.menu.is_open() || self.console.is_open();
+        if self.hud_visible || ui_open {
+            self.overlay.clear();
+            if self.hud_visible {
+                self.draw_hud();
+            }
+            self.menu.draw(&mut self.overlay);
+            self.console.draw(&mut self.overlay);
             let ui = self.ascii_processor.overlay_to_instances(&self.overlay);
             instances.extend(ui);
         }
@@ -655,13 +802,322 @@ impl AppState {
         self.metrics.fps()
     }
 
+    /// Route keyboard input to the menu and console, and apply what they report.
+    fn update_ui(&mut self) {
+        // Snapshot every key the UI cares about in one pass, so the rest of the
+        // function can borrow `self` mutably without a live borrow of `self.input`.
+        let raw = [
+            KeyCode::Tab,
+            KeyCode::Backquote,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ]
+        .map(|code| self.input.is_key_pressed(code));
+
+        // Tab opens/closes the menu; Backquote the console. They are mutually
+        // exclusive so focus is never ambiguous.
+        let toggle_menu = pressed_once(raw[0], &mut self.ui_keys_down.menu_toggle);
+        let toggle_console = pressed_once(raw[1], &mut self.ui_keys_down.console_toggle);
+
+        if toggle_menu {
+            if self.menu.is_open() {
+                self.menu.close();
+            } else {
+                self.console.close();
+                self.menu.open();
+                self.sync_menu_from_state();
+            }
+        }
+        if toggle_console {
+            if self.console.is_open() {
+                self.console.close();
+            } else {
+                self.menu.close();
+                self.console.open();
+            }
+            // Drop the backquote itself so it does not land in the input line.
+            self.input.clear_typed();
+        }
+
+        // Latch every UI key each frame, whether or not it is consumed, so a key
+        // held down while a layer opens does not fire immediately on open.
+        let up = pressed_once(raw[2], &mut self.ui_keys_down.up);
+        let down = pressed_once(raw[3], &mut self.ui_keys_down.down);
+        let enter = pressed_once(raw[4], &mut self.ui_keys_down.enter);
+        let backspace = pressed_once(raw[5], &mut self.ui_keys_down.backspace);
+        let delete = pressed_once(raw[6], &mut self.ui_keys_down.delete);
+        let left = pressed_once(raw[7], &mut self.ui_keys_down.left);
+        let right = pressed_once(raw[8], &mut self.ui_keys_down.right);
+        let home = pressed_once(raw[9], &mut self.ui_keys_down.home);
+        let end = pressed_once(raw[10], &mut self.ui_keys_down.end);
+        let page_up = pressed_once(raw[11], &mut self.ui_keys_down.page_up);
+        let page_down = pressed_once(raw[12], &mut self.ui_keys_down.page_down);
+
+        if self.console.is_open() {
+            let typed = self.input.take_typed();
+            for c in typed.chars() {
+                self.console.insert_char(c);
+            }
+            // History uses the vertical arrows, so the console maps them itself.
+            let actions = [
+                (enter, ConsoleAction::Submit),
+                (backspace, ConsoleAction::Backspace),
+                (delete, ConsoleAction::Delete),
+                (left, ConsoleAction::Left),
+                (right, ConsoleAction::Right),
+                (home, ConsoleAction::Home),
+                (end, ConsoleAction::End),
+                (up, ConsoleAction::HistoryPrev),
+                (down, ConsoleAction::HistoryNext),
+            ];
+            for (fired, action) in actions {
+                if !fired {
+                    continue;
+                }
+                if let Some(command) = self.console.handle(action) {
+                    self.run_command(&command);
+                }
+            }
+            if page_up {
+                self.console.scroll_up(4);
+            }
+            if page_down {
+                self.console.scroll_down(4);
+            }
+            return;
+        }
+
+        if self.menu.is_open() {
+            // Typed characters are irrelevant to the menu; drop them so they do
+            // not appear later in the console.
+            self.input.clear_typed();
+            let actions = [
+                (up, MenuAction::Up),
+                (down, MenuAction::Down),
+                (enter, MenuAction::Activate),
+            ];
+            for (fired, action) in actions {
+                if !fired {
+                    continue;
+                }
+                if let Some(event) = self.menu.handle(action) {
+                    self.apply_menu_event(event);
+                }
+            }
+        }
+    }
+
+    /// Push the current engine settings into the menu, so an opened menu shows
+    /// what is actually active rather than whatever it was left at.
+    fn sync_menu_from_state(&mut self) {
+        let style = if self.glyph_style == GlyphStyle::Blocks { 0 } else { 1 };
+        let color = match self.color_mode {
+            ColorMode::TrueColor => 0,
+            ColorMode::Ansi256 => 1,
+            ColorMode::Ansi16 => 2,
+            ColorMode::Grayscale => 3,
+            ColorMode::Monochrome => 4,
+        };
+        self.menu.set_choice("style", style);
+        self.menu.set_choice("color", color);
+        self.menu.set_toggle("post", self.post.any_enabled());
+        self.menu.set_toggle("grid", self.subdivision.merges());
+        self.menu.set_toggle("hud", self.hud_visible);
+    }
+
+    /// Apply what the menu reported.
+    fn apply_menu_event(&mut self, event: MenuEvent) {
+        match event {
+            MenuEvent::Activated(id) => match id.as_str() {
+                "resume" => self.menu.close(),
+                "quit" => self.should_exit = true,
+                "cam_first" => self.camera_rig.set_mode(CameraMode::FirstPerson),
+                "cam_third" => self
+                    .camera_rig
+                    .set_mode(CameraMode::ThirdPerson { distance: 8.0, height_offset: 2.0 }),
+                "cam_orbit" => self.camera_rig.set_mode(CameraMode::Orbit { distance: 10.0 }),
+                _ => {}
+            },
+            MenuEvent::Toggled(id, on) => match id.as_str() {
+                "post" => {
+                    self.post = if on {
+                        PostProcessSettings::demo()
+                    } else {
+                        PostProcessSettings::none()
+                    }
+                }
+                "grid" => {
+                    self.subdivision = if on {
+                        SubdivisionPolicy::default()
+                    } else {
+                        SubdivisionPolicy::uniform()
+                    }
+                }
+                "hud" => self.hud_visible = on,
+                _ => {}
+            },
+            MenuEvent::Chose(id, index) => match id.as_str() {
+                "style" => {
+                    self.glyph_style = if index == 0 { GlyphStyle::Blocks } else { GlyphStyle::Ramp }
+                }
+                "color" => {
+                    self.color_mode = match index {
+                        1 => ColorMode::Ansi256,
+                        2 => ColorMode::Ansi16,
+                        3 => ColorMode::Grayscale,
+                        4 => ColorMode::Monochrome,
+                        _ => ColorMode::TrueColor,
+                    }
+                }
+                _ => {}
+            },
+            MenuEvent::Closed => {}
+        }
+    }
+
+    /// Whether a console command or menu entry asked the application to quit.
+    pub fn should_exit(&self) -> bool {
+        self.should_exit
+    }
+
+    /// Execute a console command line.
+    ///
+    /// Command handling lives here rather than in the console module because the
+    /// commands act on engine state; the console only owns the text.
+    fn run_command(&mut self, line: &str) {
+        let mut parts = line.split_whitespace();
+        let Some(command) = parts.next() else {
+            return;
+        };
+        let arg = parts.next();
+
+        /// Parse an on/off argument, defaulting to toggling.
+        fn on_off(arg: Option<&str>, current: bool) -> bool {
+            match arg {
+                Some("on") | Some("1") | Some("true") => true,
+                Some("off") | Some("0") | Some("false") => false,
+                _ => !current,
+            }
+        }
+
+        match command {
+            "help" => {
+                self.console.print("commands:");
+                self.console.print("  help              this list");
+                self.console.print("  fps               current frame rate");
+                self.console.print("  scene             entity and material counts");
+                self.console.print("  post [on|off]     post-processing");
+                self.console.print("  grid [on|off]     dynamic cell grid");
+                self.console.print("  hud [on|off]      HUD overlay");
+                self.console.print("  style [block|ramp] glyph style");
+                self.console.print("  color <true|256|16|grey|mono>");
+                self.console.print("  cam <first|third|orbit>");
+                self.console.print("  clear             wipe the scrollback");
+                self.console.print("  quit              exit");
+            }
+            "fps" => {
+                let fps = self.metrics.fps();
+                self.console.print(format!("{fps:.0} FPS, {} glyphs", self.drawn_count));
+            }
+            "scene" => {
+                let entities = self.scene.all_entities().len();
+                let meshes = self.scene.entities_with::<MeshComponent>().len();
+                self.console.print(format!(
+                    "{entities} entities, {meshes} meshes, {} drawn, {} culled, {} materials",
+                    self.drawn_count,
+                    self.culled_count,
+                    self.materials.len()
+                ));
+            }
+            "post" => {
+                let on = on_off(arg, self.post.any_enabled());
+                self.post = if on {
+                    PostProcessSettings::demo()
+                } else {
+                    PostProcessSettings::none()
+                };
+                self.console.print(format!("post: {}", if on { "on" } else { "off" }));
+            }
+            "grid" => {
+                let on = on_off(arg, self.subdivision.merges());
+                self.subdivision = if on {
+                    SubdivisionPolicy::default()
+                } else {
+                    SubdivisionPolicy::uniform()
+                };
+                self.console.print(format!("grid: {}", if on { "dynamic" } else { "uniform" }));
+            }
+            "hud" => {
+                self.hud_visible = on_off(arg, self.hud_visible);
+                self.console
+                    .print(format!("hud: {}", if self.hud_visible { "on" } else { "off" }));
+            }
+            "style" => match arg {
+                Some("block") | Some("blocks") => {
+                    self.glyph_style = GlyphStyle::Blocks;
+                    self.console.print("style: blocks");
+                }
+                Some("ramp") => {
+                    self.glyph_style = GlyphStyle::Ramp;
+                    self.console.print("style: ramp");
+                }
+                _ => self.console.print_error("usage: style <block|ramp>"),
+            },
+            "color" => match arg {
+                Some("true") => self.set_color_mode(ColorMode::TrueColor),
+                Some("256") => self.set_color_mode(ColorMode::Ansi256),
+                Some("16") => self.set_color_mode(ColorMode::Ansi16),
+                Some("grey") | Some("gray") => self.set_color_mode(ColorMode::Grayscale),
+                Some("mono") => self.set_color_mode(ColorMode::Monochrome),
+                _ => self
+                    .console
+                    .print_error("usage: color <true|256|16|grey|mono>"),
+            },
+            "cam" => match arg {
+                Some("first") => {
+                    self.camera_rig.set_mode(CameraMode::FirstPerson);
+                    self.console.print("camera: first person");
+                }
+                Some("third") => {
+                    self.camera_rig
+                        .set_mode(CameraMode::ThirdPerson { distance: 8.0, height_offset: 2.0 });
+                    self.console.print("camera: third person");
+                }
+                Some("orbit") => {
+                    self.camera_rig.set_mode(CameraMode::Orbit { distance: 10.0 });
+                    self.console.print("camera: orbit");
+                }
+                _ => self.console.print_error("usage: cam <first|third|orbit>"),
+            },
+            "clear" => {
+                self.console.handle(ConsoleAction::Clear);
+            }
+            "quit" | "exit" => self.should_exit = true,
+            other => self
+                .console
+                .print_error(format!("unknown command: {other} (try 'help')")),
+        }
+    }
+
+    fn set_color_mode(&mut self, mode: ColorMode) {
+        self.color_mode = mode;
+        self.console.print(format!("color: {mode:?}"));
+    }
+
     /// Redraw the HUD into the overlay: stats in the top-left, the active
     /// toggles below them, and a centre crosshair.
     fn draw_hud(&mut self) {
         const TEXT: [f32; 3] = [0.85, 0.95, 0.85];
         const DIM: [f32; 3] = [0.45, 0.55, 0.45];
-
-        self.overlay.clear();
 
         let fps = self.metrics.fps();
         self.overlay
@@ -695,7 +1151,7 @@ impl AppState {
             DIM,
         );
         self.overlay
-            .draw_text(1, 6, "KEYS C M P G H B", DIM);
+            .draw_text(1, 6, "TAB MENU  ` CONSOLE", DIM);
 
         // Crosshair at the centre of the grid.
         let (cx, cy) = (self.grid_cols / 2, self.grid_rows / 2);

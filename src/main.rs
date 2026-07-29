@@ -10,6 +10,7 @@ mod engine;
 mod graphics;
 mod renderer;
 mod scene;
+mod ui;
 
 use engine::core::Result;
 use engine::platform;
@@ -63,14 +64,30 @@ impl ApplicationHandler for MainApp {
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
                         state: key_state,
+                        text,
                         ..
                     },
                 ..
             } => {
+                let mut consumed_escape = false;
                 if let Some(s) = self.state.borrow_mut().as_mut() {
                     s.input_mut().key_event(code, key_state);
+                    // Forward the logical text so the console can be typed into.
+                    // Only on press, and only when a UI layer wants it — otherwise
+                    // movement keys would queue up as stray characters.
+                    if key_state == ElementState::Pressed && s.ui_wants_text() {
+                        if let Some(text) = text.as_ref() {
+                            s.input_mut().text_input(text);
+                        }
+                    }
+                    if code == KeyCode::Escape && key_state == ElementState::Pressed {
+                        // Escape closes an open menu/console first; only a second
+                        // press with nothing open quits.
+                        consumed_escape = s.handle_escape();
+                    }
                 }
-                if code == KeyCode::Escape && key_state == ElementState::Pressed {
+                if code == KeyCode::Escape && key_state == ElementState::Pressed && !consumed_escape
+                {
                     elwt.exit();
                 }
             }
@@ -115,6 +132,11 @@ impl ApplicationHandler for MainApp {
         if let Some(s) = self.state.borrow_mut().as_mut() {
             if let Err(e) = s.render() {
                 eprintln!("Render error: {e}");
+                elwt.exit();
+            }
+            // The menu's Quit entry and the console's `quit` command request
+            // shutdown through the state rather than reaching for the event loop.
+            if s.should_exit() {
                 elwt.exit();
             }
         }
