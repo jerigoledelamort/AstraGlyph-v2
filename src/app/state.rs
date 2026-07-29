@@ -6,7 +6,10 @@ use crate::engine::core::Result;
 use crate::ascii::{compute_tiles, ColorMode, SubdivisionPolicy};
 use crate::engine::math::{Mat4, Vec3};
 use crate::graphics::GraphicsContext;
-use crate::renderer::{AsciiProcessor, CompositePipeline, LightUniform, ObjectUniform, ScenePipeline};
+use crate::renderer::{
+    post_process, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer, LightUniform,
+    ObjectUniform, PostProcessSettings, ScenePipeline,
+};
 use crate::scene::{
     Aabb, Camera, CameraMode, CameraRig, Entity, Frustum, Hierarchy, MaterialComponent,
     MaterialRegistry, MeshComponent, Scene, TransformComponent,
@@ -209,6 +212,10 @@ pub struct AppState {
     color_mode: ColorMode,
     /// Latch for the colour-mode key.
     color_key_was_down: bool,
+    /// Post-processing settings (bloom / SSAO / gamma / aberration). Toggled with P.
+    post: PostProcessSettings,
+    /// Latch for the post-processing key.
+    post_key_was_down: bool,
 }
 
 impl AppState {
@@ -276,6 +283,10 @@ impl AppState {
             // lower-fidelity terminal palettes.
             color_mode: ColorMode::TrueColor,
             color_key_was_down: false,
+            // Off by default so the baseline image stays unfiltered; P enables
+            // the demo preset.
+            post: PostProcessSettings::none(),
+            post_key_was_down: false,
         })
     }
 
@@ -328,6 +339,21 @@ impl AppState {
             eprintln!("color: mode = {:?}", self.color_mode);
         }
         self.color_key_was_down = color_key_down;
+
+        // P toggles post-processing (edge-triggered).
+        let post_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyP);
+        if post_key_down && !self.post_key_was_down {
+            self.post = if self.post.any_enabled() {
+                PostProcessSettings::none()
+            } else {
+                PostProcessSettings::demo()
+            };
+            eprintln!(
+                "post: effects {}",
+                if self.post.any_enabled() { "ON (demo preset)" } else { "OFF" }
+            );
+        }
+        self.post_key_was_down = post_key_down;
 
         // Update scene uniforms.
         self.scene_pipeline.update_camera(&self.graphics.queue, &self.camera);
@@ -417,26 +443,48 @@ impl AppState {
 
         // Read back the scene render target pixels (double-buffered, non-blocking —
         // may lag the current frame by ~1 frame, never stalls the CPU on the GPU).
-        let pixels = self.ascii_processor.read_pixels(
+        let mut pixels = self.ascii_processor.read_pixels(
             &self.graphics.device,
             &self.graphics.queue,
             &self.scene_pipeline.target_texture,
         );
 
-        // Convert pixels to glyph instance data. With a merging policy active,
-        // depth decides which cells collapse into larger glyphs — so the depth
-        // buffer is only read back when it will actually be used.
-        let (sw, sh) = self.graphics.size();
-        let mut instances = if self.subdivision.merges() {
-            let depth = self.ascii_processor.read_depth(
+        // Depth is needed by the dynamic grid and by SSAO; read it back once if
+        // either of them wants it, and skip the transfer entirely otherwise.
+        let needs_depth = self.subdivision.merges() || self.post.any_enabled();
+        let depth = if needs_depth {
+            Some(self.ascii_processor.read_depth(
                 &self.graphics.device,
                 &self.graphics.queue,
                 self.scene_pipeline.depth_texture(),
-            );
-            let tiles = compute_tiles(&depth, self.grid_cols, self.grid_rows, &self.subdivision);
-            self.ascii_processor.pixels_to_instances_tiled(&pixels, &tiles)
+            ))
         } else {
-            self.ascii_processor.pixels_to_instances(&pixels, sw, sh)
+            None
+        };
+
+        // Post-processing runs on the pixel buffer, before glyphs are chosen, so
+        // bloom and AO influence which character each cell gets — not just its
+        // colour. That is the whole point of doing it "in ASCII space".
+        if self.post.any_enabled() {
+            if let Ok(mut fb) = FrameBuffer::from_rgba8(&pixels, self.grid_cols, self.grid_rows) {
+                let depth_buf = depth.as_ref().and_then(|d| {
+                    DepthBuffer::from_slice(d, self.grid_cols, self.grid_rows).ok()
+                });
+                post_process::apply_all(&mut fb, depth_buf.as_ref(), &self.post);
+                pixels = fb.to_rgba8();
+            }
+        }
+
+        // Convert pixels to glyph instance data. With a merging policy active,
+        // depth decides which cells collapse into larger glyphs.
+        let (sw, sh) = self.graphics.size();
+        let mut instances = match (self.subdivision.merges(), depth.as_ref()) {
+            (true, Some(depth)) => {
+                let tiles =
+                    compute_tiles(depth, self.grid_cols, self.grid_rows, &self.subdivision);
+                self.ascii_processor.pixels_to_instances_tiled(&pixels, &tiles)
+            }
+            _ => self.ascii_processor.pixels_to_instances(&pixels, sw, sh),
         };
 
         // Quantize to the selected colour fidelity. Done on the instances rather

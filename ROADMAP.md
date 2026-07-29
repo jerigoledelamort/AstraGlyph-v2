@@ -66,20 +66,20 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 *Push ASCII art to its visual limits.*
 
 ### 3.1 Glyph System
-- [ ] Dynamic cell grid (variable cell sizes — higher detail near camera)
+- [x] Dynamic cell grid (variable cell sizes — depth-driven merging, toggle: G)
 - [ ] Extended Unicode set (CJK characters, emojis for fun)
-- [ ] Color modes: ANSI 256, TrueColor (16M), indexed palette
+- [x] Color modes: ANSI 256, TrueColor (16M), ANSI 16, grayscale (cycle: M)
 - [ ] TTF font loading → bitmap atlas (fallback if no procedural font)
 
 ### 3.2 Post-Processing
-- [ ] Bloom effect in ASCII space
-- [ ] SSAO (Screen-Space Ambient Occlusion) → ASCII
-- [ ] Gamma correction
-- [ ] Chromatic aberration (for retro CRT feel)
+- [x] Bloom effect in ASCII space
+- [x] SSAO (Screen-Space Ambient Occlusion) → ASCII
+- [x] Gamma correction
+- [x] Chromatic aberration (for retro CRT feel)
 
 ### 3.3 UI Layer
-- [ ] 2D ASCII overlay on top of 3D scene
-- [ ] HUD elements (FPS counter, debug info, crosshair)
+- [x] 2D ASCII overlay on top of 3D scene (buffer + compositing)
+- [ ] HUD elements (FPS counter, debug info, crosshair) — needs text glyphs (TTF)
 - [ ] Menu system (text-based menus, buttons, navigation)
 - [ ] Console / debug command line
 
