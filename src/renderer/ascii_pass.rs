@@ -23,20 +23,32 @@ pub enum GlyphStyle {
     Ramp,
 }
 
-/// One of the two ping-ponged readback buffers.
+/// One of the ping-ponged readback buffers.
 struct ReadbackSlot {
     buffer: Buffer,
     /// Set once `map_async` has been issued; cleared once the result has
     /// been consumed (successfully or not). While set, this buffer must not
     /// be copied into or re-mapped.
     pending: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Monotonic submission number, so slots completing in the same frame are
+    /// applied oldest-first and a newer frame is never replaced by an older one.
+    sequence: u64,
+}
+
+/// Index of the first slot not awaiting a mapping, if any.
+///
+/// Deliberately "any free slot" rather than a fixed rotation: tying submission to
+/// an alternating index is what allowed the readback to wedge permanently when one
+/// slot was slow to complete.
+fn first_free(slots: &[ReadbackSlot]) -> Option<usize> {
+    slots.iter().position(|slot| slot.pending.is_none())
 }
 
 /// Handles GPU texture readback and ASCII conversion.
 pub struct AsciiProcessor {
     slots: [ReadbackSlot; 2],
-    /// Index into `slots` that will receive the next copy + map_async.
-    write_index: usize,
+    /// Monotonic counter handed to each submission (see `ReadbackSlot::sequence`).
+    next_sequence: u64,
     /// Buffer size in bytes (padded to 256-byte rows).
     #[allow(dead_code)]
     buffer_size: u64,
@@ -51,7 +63,6 @@ pub struct AsciiProcessor {
     /// Depth32Float is 4 bytes per pixel, so the row padding differs from the
     /// colour path only in that it holds f32 rather than RGBA8.
     depth_slots: [ReadbackSlot; 2],
-    depth_write_index: usize,
     depth_bytes_per_row: u32,
     /// Most recently completed depth frame, 0..1 window-space depth
     /// (1.0 = far plane / nothing drawn).
@@ -87,20 +98,19 @@ impl AsciiProcessor {
 
         Self {
             slots: [
-                ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_0"), pending: None },
-                ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_1"), pending: None },
+                ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_0"), pending: None, sequence: 0 },
+                ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_1"), pending: None, sequence: 0 },
             ],
-            write_index: 0,
+            next_sequence: 1,
             buffer_size,
             width,
             height,
             bytes_per_row,
             last_pixels: vec![[0, 0, 0, 255]; (width * height) as usize],
             depth_slots: [
-                ReadbackSlot { buffer: make_depth_buffer("ascii_depth_readback_0"), pending: None },
-                ReadbackSlot { buffer: make_depth_buffer("ascii_depth_readback_1"), pending: None },
+                ReadbackSlot { buffer: make_depth_buffer("ascii_depth_readback_0"), pending: None, sequence: 0 },
+                ReadbackSlot { buffer: make_depth_buffer("ascii_depth_readback_1"), pending: None, sequence: 0 },
             ],
-            depth_write_index: 0,
             depth_bytes_per_row,
             // 1.0 = far plane, i.e. "nothing here", the correct neutral value
             // for SSAO and subdivision before the first frame lands.
@@ -125,26 +135,53 @@ impl AsciiProcessor {
         // Give any in-flight map_async callbacks a chance to fire, without blocking.
         let _ = device.poll(wgpu::PollType::Poll);
 
-        let read_index = 1 - self.write_index;
-        if let Some(rx) = &self.slots[read_index].pending {
-            if let Ok(result) = rx.try_recv() {
-                self.slots[read_index].pending = None;
-                if result.is_ok() {
-                    self.extract_pixels(read_index);
-                }
-                self.slots[read_index].buffer.unmap();
-            }
-            // else: still pending — keep serving `last_pixels` from before.
-        }
+        // Drain EVERY completed slot, oldest submission first.
+        //
+        // This used to look at a single `read_index` derived from `write_index`,
+        // and that deadlocked: if the slot being written had not completed, no
+        // copy was submitted AND the index was never flipped, so the other slot
+        // stopped being checked entirely. Its callback would fire, its result sat
+        // unread in the channel forever, and no new copies were ever issued. The
+        // visible effect was the scene freezing on a stale frame while the HUD —
+        // which does not go through readback — kept updating. Removing vsync made
+        // the race essentially certain to be hit within seconds.
+        self.drain_completed_pixels();
 
-        // Only submit new work into a slot that isn't already awaiting a map.
-        if self.slots[self.write_index].pending.is_none() {
-            self.submit_copy(device, queue, source, self.write_index);
-            self.write_index = read_index;
+        // Submit into whichever slot is free; there is no fixed turn order.
+        if let Some(free) = first_free(&self.slots) {
+            self.submit_copy(device, queue, source, free);
         }
 
         self.last_pixels.clone()
     }
+
+    /// Extract every colour slot whose mapping has completed, in submission
+    /// order so a newer frame is never overwritten by an older one.
+    fn drain_completed_pixels(&mut self) {
+        let mut ready: Vec<(u64, usize)> = Vec::new();
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            let Some(rx) = &slot.pending else { continue };
+            match rx.try_recv() {
+                Ok(result) => {
+                    slot.pending = None;
+                    if result.is_ok() {
+                        ready.push((slot.sequence, index));
+                    } else {
+                        // Mapping failed (device lost, resize): release the slot so
+                        // it can be reused instead of being pending forever.
+                        slot.buffer.unmap();
+                    }
+                }
+                Err(_) => {} // still in flight
+            }
+        }
+        ready.sort_unstable();
+        for (_, index) in ready {
+            self.extract_pixels(index);
+            self.slots[index].buffer.unmap();
+        }
+    }
+
 
     /// Advance the double-buffered *depth* readback by one frame, mirroring
     /// `read_pixels`. Returns the most recently completed depth frame as
@@ -160,23 +197,39 @@ impl AsciiProcessor {
     ) -> Vec<f32> {
         let _ = device.poll(wgpu::PollType::Poll);
 
-        let read_index = 1 - self.depth_write_index;
-        if let Some(rx) = &self.depth_slots[read_index].pending {
-            if let Ok(result) = rx.try_recv() {
-                self.depth_slots[read_index].pending = None;
-                if result.is_ok() {
-                    self.extract_depth(read_index);
-                }
-                self.depth_slots[read_index].buffer.unmap();
-            }
-        }
+        // Same fix as the colour path: drain every completed slot and submit into
+        // any free one, rather than alternating a fixed index that can wedge.
+        self.drain_completed_depth();
 
-        if self.depth_slots[self.depth_write_index].pending.is_none() {
-            self.submit_depth_copy(device, queue, depth_source, self.depth_write_index);
-            self.depth_write_index = read_index;
+        if let Some(free) = first_free(&self.depth_slots) {
+            self.submit_depth_copy(device, queue, depth_source, free);
         }
 
         self.last_depth.clone()
+    }
+
+    /// Extract every depth slot whose mapping has completed, oldest first.
+    fn drain_completed_depth(&mut self) {
+        let mut ready: Vec<(u64, usize)> = Vec::new();
+        for (index, slot) in self.depth_slots.iter_mut().enumerate() {
+            let Some(rx) = &slot.pending else { continue };
+            match rx.try_recv() {
+                Ok(result) => {
+                    slot.pending = None;
+                    if result.is_ok() {
+                        ready.push((slot.sequence, index));
+                    } else {
+                        slot.buffer.unmap();
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        ready.sort_unstable();
+        for (_, index) in ready {
+            self.extract_depth(index);
+            self.depth_slots[index].buffer.unmap();
+        }
     }
 
     /// Copy the depth texture into `slot_index`'s buffer and start an async map.
@@ -223,6 +276,8 @@ impl AsciiProcessor {
                 let _ = tx.send(result);
             });
         self.depth_slots[slot_index].pending = Some(rx);
+        self.depth_slots[slot_index].sequence = self.next_sequence;
+        self.next_sequence += 1;
     }
 
     /// Decode the mapped depth bytes into `last_depth`, skipping row padding.
@@ -290,6 +345,8 @@ impl AsciiProcessor {
                 let _ = tx.send(result);
             });
         self.slots[slot_index].pending = Some(rx);
+        self.slots[slot_index].sequence = self.next_sequence;
+        self.next_sequence += 1;
     }
 
     /// Read the mapped bytes out of `slot_index`'s buffer into `last_pixels`,
@@ -602,5 +659,75 @@ mod tests {
         let (x, y, _, _) = tile_rect(&Tile { col: 0, row: 0, span: 1 }, 10, 10);
         assert!((x + 1.0).abs() < 1e-6, "x should start at -1");
         assert!((y - 1.0).abs() < 1e-6, "y should start at +1");
+    }
+
+    /// Regression for the readback deadlock that froze the scene while the HUD
+    /// kept updating.
+    ///
+    /// Models the slot bookkeeping without a GPU: `pending[i]` says whether slot
+    /// `i` still awaits a mapping. The old scheme derived the slot to drain from
+    /// the slot being written (`read = 1 - write`) and only advanced `write` after
+    /// submitting. Replayed below, that wedges permanently as soon as one slot is
+    /// slow. The current scheme — drain anything complete, submit into anything
+    /// free — keeps going.
+    #[test]
+    fn readback_never_wedges_when_one_slot_is_slow() {
+        // The old, broken policy, kept as the thing being guarded against.
+        fn old_policy(pending: &mut [bool; 2], write: &mut usize, completes: [bool; 2]) -> bool {
+            let read = 1 - *write;
+            if pending[read] && completes[read] {
+                pending[read] = false;
+            }
+            if !pending[*write] {
+                pending[*write] = true; // submit
+                *write = read;
+                return true;
+            }
+            false
+        }
+
+        // The current policy.
+        fn new_policy(pending: &mut [bool; 2], completes: [bool; 2]) -> bool {
+            for i in 0..2 {
+                if pending[i] && completes[i] {
+                    pending[i] = false;
+                }
+            }
+            if let Some(free) = (0..2).find(|&i| !pending[i]) {
+                pending[free] = true; // submit
+                return true;
+            }
+            false
+        }
+
+        // Slot 0 never reports completion, slot 1 always does — the shape of the
+        // real failure, where one mapping lags while the other keeps finishing.
+        let completes = [false, true];
+
+        let mut pending = [false, false];
+        let mut write = 0usize;
+        let mut old_submissions = 0;
+        for _ in 0..200 {
+            if old_policy(&mut pending, &mut write, completes) {
+                old_submissions += 1;
+            }
+        }
+
+        let mut pending = [false, false];
+        let mut new_submissions = 0;
+        for _ in 0..200 {
+            if new_policy(&mut pending, completes) {
+                new_submissions += 1;
+            }
+        }
+
+        assert!(
+            old_submissions < 5,
+            "the old policy should visibly stall; it submitted {old_submissions} times"
+        );
+        assert!(
+            new_submissions > 90,
+            "the current policy must keep submitting; got {new_submissions} in 200 frames"
+        );
     }
 }
