@@ -7,8 +7,9 @@ use crate::ascii::{compute_tiles, ColorMode, Overlay, OverlayCell, SubdivisionPo
 use crate::engine::math::{degrees, radians, Mat4, Vec3};
 use crate::graphics::{FrameOutcome, GraphicsContext};
 use crate::renderer::{
-    post_process, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer, GlyphStyle,
-    LightUniform, ObjectUniform, PostProcessSettings, ScenePipeline,
+    post_process, trace_flags, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer,
+    GlyphStyle, InstanceRequest, LightUniform, ObjectUniform, PostProcessSettings, RayTracer,
+    ScenePipeline, TraceSettings,
 };
 use crate::scene::{
     Aabb, Camera, CameraMode, CameraRig, Entity, Frustum, Hierarchy, MaterialComponent,
@@ -185,6 +186,7 @@ fn build_menu() -> Menu {
                 vec!["True".into(), "256".into(), "16".into(), "Grey".into(), "Mono".into()],
                 0,
             ),
+            MenuItem::toggle("Ray tracing", "trace", false),
             MenuItem::toggle("Post FX", "post", false),
             MenuItem::toggle("Dynamic grid", "grid", false),
             MenuItem::toggle("HUD", "hud", true),
@@ -253,6 +255,18 @@ fn load_startup_scene() -> (Scene, Camera, Vec<LightUniform>, Hierarchy) {
 pub struct AppState {
     pub graphics: GraphicsContext,
     scene_pipeline: ScenePipeline,
+    /// Acceleration structures for the traced path. `None` on hardware without
+    /// ray query, which is what makes the whole traced path optional rather than
+    /// a hard requirement.
+    ray_tracer: Option<RayTracer>,
+    /// Ray budget and feature flags for the traced path.
+    trace_settings: TraceSettings,
+    /// Whether the traced path is active this frame. Toggled with R for the
+    /// raster/traced A/B comparison; forced off when there is no ray tracer.
+    traced_enabled: bool,
+    trace_key_was_down: bool,
+    /// Frames rendered since startup.
+    frame_counter: u32,
     composite_pipeline: CompositePipeline,
     ascii_processor: AsciiProcessor,
     camera: Camera,
@@ -361,12 +375,22 @@ impl AppState {
         let sub_cols = grid_cols * SUBSAMPLE;
         let sub_rows = grid_rows * SUBSAMPLE;
 
+        // Acceleration structures come first: the traced pipeline needs their
+        // bind group layout, and on hardware without ray query there is no
+        // layout, no traced pipeline, and no traced shader compiled at all.
+        let ray_tracer = if graphics.ray_tracing().is_enabled() {
+            Some(RayTracer::new(&graphics.device))
+        } else {
+            None
+        };
+
         let scene_format = wgpu::TextureFormat::Rgba8Unorm;
         let scene_pipeline = ScenePipeline::new(
             &graphics.device,
             sub_cols,
             sub_rows,
             scene_format,
+            ray_tracer.as_ref().map(|rt| rt.layout()),
         )?;
 
         // The instance buffer holds the scene cells plus the UI overlay drawn on
@@ -388,9 +412,18 @@ impl AppState {
 
         let camera_rig = seed_rig_from_camera(&camera);
 
+        // Tracing is the default whenever the hardware allows it: it is the point
+        // of the phase, and R switches back to rasterising for comparison.
+        let traced_enabled = ray_tracer.is_some() && scene_pipeline.supports_tracing();
+
         Ok(Self {
             graphics,
             scene_pipeline,
+            ray_tracer,
+            trace_settings: TraceSettings::default(),
+            traced_enabled,
+            trace_key_was_down: false,
+            frame_counter: 0,
             composite_pipeline,
             ascii_processor,
             camera,
@@ -614,6 +647,16 @@ impl AppState {
         }
         self.style_key_was_down = style_key_down;
 
+        // R switches between rasterised and traced lighting. This is the A/B
+        // comparison the phase requires: without it there is no way to tell a
+        // traced regression from a traced feature.
+        let trace_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyR);
+        if trace_key_down && !self.trace_key_was_down {
+            self.toggle_tracing();
+        }
+        self.trace_key_was_down = trace_key_down;
+
         // Update scene uniforms.
         self.scene_pipeline.update_camera(&self.graphics.queue, &self.camera);
         self.scene_pipeline.update_lights(&self.graphics.queue, &self.lights);
@@ -642,6 +685,7 @@ impl AppState {
 
         let mut meshes: Vec<(_, _, u32)> = Vec::new();
         let mut objects: Vec<ObjectUniform> = Vec::new();
+        let mut all_instances: Vec<(InstanceRequest, &MeshComponent)> = Vec::new();
         self.materials.clear();
         let mut scene_bounds: Option<Aabb> = None;
         let mut culled = 0usize;
@@ -661,15 +705,28 @@ impl AppState {
                 None => world_bounds,
             });
 
-            if !frustum.intersects_aabb(&world_bounds) {
-                culled += 1;
-                continue;
-            }
-
+            // Materials are registered before the cull test, not after: a culled
+            // mesh still needs a valid material slot because a ray can reach it.
+            // As a side effect the material count reports the whole scene rather
+            // than only what is on screen, which is the more useful number.
             let material_index = match self.scene.get_component::<MaterialComponent>(entity) {
                 Some(mat) => self.materials.register(mat),
                 None => self.materials.register(&MaterialComponent::default()),
             };
+
+            all_instances.push((
+                InstanceRequest {
+                    entity_id: entity.id(),
+                    model,
+                    material_index,
+                },
+                mesh,
+            ));
+
+            if !frustum.intersects_aabb(&world_bounds) {
+                culled += 1;
+                continue;
+            }
 
             let object_index = objects.len() as u32;
             objects.push(ObjectUniform::new(model, material_index));
@@ -677,6 +734,22 @@ impl AppState {
         }
         self.drawn_count = meshes.len();
         self.culled_count = culled;
+
+        // Acceleration structures track the *unculled* instance list on purpose.
+        //
+        // Frustum culling is a rasterisation optimisation: a fragment shader can
+        // never need a mesh it did not draw. A ray can. An object behind the
+        // camera still shows up in a mirror and still blocks a shadow ray, so
+        // culling it out of the TLAS would make reflections pop in and out as the
+        // camera turns — the same class of bug the shadow frustum already avoids
+        // by accumulating bounds over all meshes.
+        let traced_active = self.traced_enabled && self.ray_tracer.is_some();
+        if traced_active {
+            if let Some(rt) = self.ray_tracer.as_mut() {
+                rt.update(&self.graphics.device, &self.graphics.queue, &all_instances);
+                rt.upload_settings(&self.graphics.queue, &self.trace_settings);
+            }
+        }
 
         // Upload per-object transforms and deduplicated materials to the GPU.
         self.scene_pipeline.upload_objects(&self.graphics.queue, &objects);
@@ -690,6 +763,11 @@ impl AppState {
         }
 
         // Render all meshes in a single render pass (GPU phase 1: scene).
+        let traced_group = if traced_active {
+            self.ray_tracer.as_ref().map(|rt| rt.bind_group())
+        } else {
+            None
+        };
         let gpu_start = Instant::now();
         self.scene_pipeline.render_batched(
             &self.graphics.device,
@@ -697,6 +775,7 @@ impl AppState {
             &meshes,
             &objects,
             &materials,
+            traced_group,
         )?;
         self.metrics.record_gpu_phase(gpu_start);
 
@@ -710,7 +789,18 @@ impl AppState {
 
         // Depth is needed by the dynamic grid and by SSAO; read it back once if
         // either of them wants it, and skip the transfer entirely otherwise.
-        let needs_depth = self.subdivision.merges() || self.post.any_enabled();
+        // Screen-space AO is dropped while tracing: the traced path already
+        // attenuated the ambient term with rays that can see what the depth
+        // buffer cannot, and applying the approximation on top of it would
+        // darken every crease twice.
+        let post = if traced_active {
+            self.post.without_ssao()
+        } else {
+            self.post
+        };
+        // Depth is only consumed by the dynamic grid and by screen-space AO, so
+        // dropping SSAO also drops the transfer that fed it.
+        let needs_depth = self.subdivision.merges() || post.ssao_active();
         let depth = if needs_depth {
             Some(self.ascii_processor.read_depth(
                 &self.graphics.device,
@@ -726,12 +816,12 @@ impl AppState {
         // colour. That is the whole point of doing it "in ASCII space".
         let sub_cols = self.grid_cols * SUBSAMPLE;
         let sub_rows = self.grid_rows * SUBSAMPLE;
-        if self.post.any_enabled() {
+        if post.any_enabled() {
             if let Ok(mut fb) = FrameBuffer::from_rgba8(&pixels, sub_cols, sub_rows) {
                 let depth_buf = depth
                     .as_ref()
                     .and_then(|d| DepthBuffer::from_slice(d, sub_cols, sub_rows).ok());
-                post_process::apply_all(&mut fb, depth_buf.as_ref(), &self.post);
+                post_process::apply_all(&mut fb, depth_buf.as_ref(), &post);
                 pixels = fb.to_rgba8();
             }
         }
@@ -820,12 +910,60 @@ impl AppState {
         );
         self.metrics.set_glyph_count(instance_count as usize);
         self.metrics.end_frame();
+        self.frame_counter = self.frame_counter.wrapping_add(1);
 
         Ok(())
     }
 
     pub fn fps(&self) -> f32 {
         self.metrics.fps()
+    }
+
+    /// Whether the traced path can be switched on at all on this machine.
+    fn tracing_available(&self) -> bool {
+        self.ray_tracer.is_some() && self.scene_pipeline.supports_tracing()
+    }
+
+    /// Flip between rasterised and traced lighting, reporting the result.
+    ///
+    /// On hardware without ray query this says so rather than silently doing
+    /// nothing — a dead key with no explanation is how the last round of input
+    /// bugs got misdiagnosed.
+    fn toggle_tracing(&mut self) {
+        if !self.tracing_available() {
+            eprintln!(
+                "raytracing: unavailable ({})",
+                self.graphics.ray_tracing().describe()
+            );
+            return;
+        }
+        self.traced_enabled = !self.traced_enabled;
+        eprintln!(
+            "raytracing: lighting = {}",
+            if self.traced_enabled { "TRACED" } else { "RASTER" }
+        );
+    }
+
+    /// Short description of the active lighting path plus its ray budget, for
+    /// the HUD and the console.
+    fn lighting_summary(&self) -> String {
+        if !self.tracing_available() {
+            return format!("RASTER ({})", self.graphics.ray_tracing().tag());
+        }
+        if !self.traced_enabled {
+            return "RASTER (RTX IDLE)".to_string();
+        }
+        let lights = self.lights.len().min(crate::renderer::scene_pass::MAX_LIGHTS) as u32;
+        let rays = self.trace_settings.rays_per_fragment(lights);
+        let tris = self
+            .ray_tracer
+            .as_ref()
+            .map(|rt| rt.triangle_count())
+            .unwrap_or(0);
+        format!(
+            "TRACED d{} {} rays/px {} tris",
+            self.trace_settings.max_depth, rays, tris
+        )
     }
 
     /// Route keyboard input to the menu and console, and apply what they report.
@@ -955,6 +1093,7 @@ impl AppState {
         };
         self.menu.set_choice("style", style);
         self.menu.set_choice("color", color);
+        self.menu.set_toggle("trace", self.traced_enabled);
         self.menu.set_toggle("post", self.post.any_enabled());
         self.menu.set_toggle("grid", self.subdivision.merges());
         self.menu.set_toggle("hud", self.hud_visible);
@@ -974,6 +1113,14 @@ impl AppState {
                 _ => {}
             },
             MenuEvent::Toggled(id, on) => match id.as_str() {
+                "trace" => {
+                    if on != self.traced_enabled {
+                        self.toggle_tracing();
+                    }
+                    // The menu may have moved ahead of reality (no ray query on
+                    // this machine), so push the truth back into it.
+                    self.menu.set_toggle("trace", self.traced_enabled);
+                }
                 "post" => {
                     self.post = if on {
                         PostProcessSettings::demo()
@@ -1047,6 +1194,12 @@ impl AppState {
                 self.console.print("  style [block|ramp] glyph style");
                 self.console.print("  color <true|256|16|grey|mono>");
                 self.console.print("  cam <first|third|orbit>");
+                self.console.print("  trace [on|off]    traced vs rasterised lighting");
+                self.console.print("  rays              ray budget and AS stats");
+                self.console.print("  depth <0-4>       reflection/refraction bounces");
+                self.console
+                    .print("  shadows|reflect|refract|ao [on|off]");
+                self.console.print("  samples <shadow|ao> <n>");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -1124,6 +1277,70 @@ impl AppState {
                 }
                 _ => self.console.print_error("usage: cam <first|third|orbit>"),
             },
+            "trace" => {
+                if !self.tracing_available() {
+                    self.console.print_error(format!(
+                        "raytracing unavailable: {}",
+                        self.graphics.ray_tracing().describe()
+                    ));
+                } else {
+                    let on = on_off(arg, self.traced_enabled);
+                    if on != self.traced_enabled {
+                        self.toggle_tracing();
+                    }
+                    self.console
+                        .print(format!("trace: {}", if self.traced_enabled { "on" } else { "off" }));
+                }
+            }
+            "rays" => {
+                self.console.print(self.lighting_summary());
+                self.console.print(format!(
+                    "gpu: {}",
+                    self.graphics.ray_tracing().describe()
+                ));
+                if let Some(rt) = self.ray_tracer.as_ref() {
+                    self.console.print(format!(
+                        "as: {} instances, {} tris, {} blas builds, {} tlas builds",
+                        rt.instance_count(),
+                        rt.triangle_count(),
+                        rt.blas_builds(),
+                        rt.tlas_builds()
+                    ));
+                    self.console.print(format!(
+                        "settings: depth {} shadow x{} ao x{} radius {:.2}",
+                        self.trace_settings.max_depth,
+                        self.trace_settings.shadow_samples,
+                        self.trace_settings.ao_samples,
+                        self.trace_settings.light_radius,
+                    ));
+                }
+            }
+            // Per-feature switches, so a suspicious image can be attributed to one
+            // kind of ray instead of to "the tracer".
+            "shadows" => self.toggle_trace_flag(trace_flags::SHADOWS, "shadows", arg),
+            "reflect" => self.toggle_trace_flag(trace_flags::REFLECTIONS, "reflect", arg),
+            "refract" => self.toggle_trace_flag(trace_flags::REFRACTION, "refract", arg),
+            "ao" => self.toggle_trace_flag(trace_flags::AMBIENT_OCCLUSION, "ao", arg),
+            "samples" => match (arg, parts.next().and_then(|v| v.parse::<u32>().ok())) {
+                (Some("shadow"), Some(n)) if n >= 1 && n <= 32 => {
+                    self.trace_settings.shadow_samples = n;
+                    self.console.print(format!("shadow samples: {n}"));
+                }
+                (Some("ao"), Some(n)) if n <= 32 => {
+                    self.trace_settings.ao_samples = n;
+                    self.console.print(format!("ao samples: {n}"));
+                }
+                _ => self
+                    .console
+                    .print_error("usage: samples <shadow|ao> <count>"),
+            },
+            "depth" => match arg.and_then(|a| a.parse::<u32>().ok()) {
+                Some(d) if d <= 4 => {
+                    self.trace_settings.max_depth = d;
+                    self.console.print(format!("depth: {d} bounces"));
+                }
+                _ => self.console.print_error("usage: depth <0-4>"),
+            },
             "clear" => {
                 self.console.handle(ConsoleAction::Clear);
             }
@@ -1132,6 +1349,20 @@ impl AppState {
                 .console
                 .print_error(format!("unknown command: {other} (try 'help')")),
         }
+    }
+
+    /// Flip one traced feature bit and report it. `arg` follows the same
+    /// `on`/`off`/absent-means-toggle convention as the other console switches.
+    fn toggle_trace_flag(&mut self, flag: u32, name: &str, arg: Option<&str>) {
+        let current = self.trace_settings.has(flag);
+        let on = match arg {
+            Some("on") | Some("1") | Some("true") => true,
+            Some("off") | Some("0") | Some("false") => false,
+            _ => !current,
+        };
+        self.trace_settings.set(flag, on);
+        self.console
+            .print(format!("{name}: {}", if on { "on" } else { "off" }));
     }
 
     fn set_color_mode(&mut self, mode: ColorMode) {
@@ -1176,6 +1407,15 @@ impl AppState {
             &format!("STYLE {}", if self.glyph_style == GlyphStyle::Blocks { "BLOCK" } else { "RAMP" }),
             DIM,
         );
+        // Which lighting path is running, and what it costs. Without this line
+        // the R toggle is unverifiable by eye: raster and traced can look similar
+        // on a simple scene, and "did it switch?" must not be a guess.
+        self.overlay.draw_text(
+            1,
+            6,
+            &format!("LIGHT {}", self.lighting_summary()),
+            if self.traced_enabled { [0.5, 0.85, 1.0] } else { DIM },
+        );
         // Say plainly when a UI layer owns the keyboard. A frozen camera with no
         // explanation reads as a broken build, which is exactly how it was
         // reported — the state was correct, it just was not visible anywhere.
@@ -1183,13 +1423,13 @@ impl AppState {
             let owner = if self.console.is_open() { "CONSOLE" } else { "MENU" };
             self.overlay.draw_text(
                 1,
-                6,
+                7,
                 &format!("{owner} HAS FOCUS - ESC TO CLOSE"),
                 [1.0, 0.75, 0.3],
             );
         } else {
             self.overlay
-                .draw_text(1, 6, "TAB MENU  ` CONSOLE", DIM);
+                .draw_text(1, 7, "TAB MENU  ` CONSOLE", DIM);
         }
 
         // Crosshair at the centre of the grid.

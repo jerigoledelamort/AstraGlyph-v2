@@ -217,6 +217,27 @@ impl PostProcessSettings {
             || self.ssao_enabled()
     }
 
+    /// The same settings with screen-space AO removed.
+    ///
+    /// Used when ray-traced occlusion is active. The two are the same
+    /// measurement computed twice, and the traced one is strictly better
+    /// informed: its rays see geometry that is off-screen or hidden behind a
+    /// nearer surface, which is exactly what a depth buffer cannot report.
+    /// Running both darkens every crease twice, and the result reads as a
+    /// lighting bug rather than as two effects stacking.
+    pub const fn without_ssao(mut self) -> Self {
+        self.ssao_radius = 0;
+        self.ssao_strength = 0.0;
+        self
+    }
+
+    /// Whether screen-space AO would run. Public because the choice between it
+    /// and the traced version is made by the caller that knows which lighting
+    /// path is active.
+    pub fn ssao_active(&self) -> bool {
+        self.ssao_enabled()
+    }
+
     fn gamma_enabled(&self) -> bool {
         self.gamma.is_finite() && self.gamma > 0.0 && (self.gamma - 1.0).abs() > f32::EPSILON
     }
@@ -234,6 +255,38 @@ impl PostProcessSettings {
 
     fn ssao_enabled(&self) -> bool {
         self.ssao_radius > 0 && self.ssao_strength.is_finite() && self.ssao_strength > 0.0
+    }
+}
+
+#[cfg(test)]
+mod traced_interaction_tests {
+    use super::*;
+
+    /// `without_ssao` must silence screen-space AO and leave every other effect
+    /// alone — the traced path replaces occlusion, not bloom or gamma.
+    #[test]
+    fn without_ssao_disables_only_occlusion() {
+        let demo = PostProcessSettings::demo();
+        assert!(demo.ssao_active(), "the demo preset should include SSAO");
+        let traced = demo.without_ssao();
+        assert!(!traced.ssao_active());
+        assert_eq!(traced.gamma, demo.gamma);
+        assert_eq!(traced.bloom_intensity, demo.bloom_intensity);
+        assert_eq!(traced.bloom_radius, demo.bloom_radius);
+        assert_eq!(traced.bloom_threshold, demo.bloom_threshold);
+        assert_eq!(traced.aberration_strength, demo.aberration_strength);
+        assert!(
+            traced.any_enabled(),
+            "removing SSAO must not disable the whole post stack"
+        );
+    }
+
+    #[test]
+    fn without_ssao_is_idempotent_and_safe_on_none() {
+        let none = PostProcessSettings::none().without_ssao();
+        assert!(!none.any_enabled());
+        let twice = PostProcessSettings::demo().without_ssao().without_ssao();
+        assert!(!twice.ssao_active());
     }
 }
 

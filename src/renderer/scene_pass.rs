@@ -197,6 +197,11 @@ pub struct ScenePipeline {
     opaque_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     glass_tint_pipeline: wgpu::RenderPipeline,
+    /// Ray-traced counterpart of `opaque_pipeline`, present only when the device
+    /// has ray query. It handles *every* material, transparent included: a
+    /// refraction ray already reports what is behind the glass, so there is
+    /// nothing left to alpha-blend against (see `scene_traced_fragment.wgsl`).
+    traced_pipeline: Option<wgpu::RenderPipeline>,
     vp_buffer: wgpu::Buffer,
     lights_meta_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -230,15 +235,37 @@ pub struct ScenePipeline {
 }
 
 impl ScenePipeline {
+    /// Build the scene pipelines.
+    ///
+    /// `traced_layout` is the ray-tracing bind group layout (group 1) from
+    /// `RayTracer::layout`. Passing `None` — which is what a device without ray
+    /// query must do — skips the traced pipeline entirely, so no WGSL containing
+    /// ray queries is ever compiled on hardware that cannot run it.
     pub fn new(
         device: &Device,
         width: u32,
         height: u32,
         format: TextureFormat,
+        traced_layout: Option<&wgpu::BindGroupLayout>,
     ) -> Result<Self> {
-        // Load shaders from embedded WGSL.
+        // Load shaders from embedded WGSL. WGSL has no include directive, so the
+        // shared shading code is prepended to each entry-point file here; both
+        // fragment paths must agree on the surface model exactly.
         let vs_source = include_str!("../graphics/shaders/scene_vertex.wgsl");
-        let fs_source = include_str!("../graphics/shaders/scene_fragment.wgsl");
+        let fs_source = concat!(
+            include_str!("../graphics/shaders/scene_shading.wgsl"),
+            include_str!("../graphics/shaders/scene_fragment.wgsl"),
+        );
+        // `enable` directives must precede every other item in a WGSL module, so
+        // the extension line has to be prepended here rather than living at the
+        // top of either source file: `scene_shading.wgsl` is shared with the
+        // rasterised path, which must stay compilable on a device that has no
+        // ray query to enable.
+        let traced_fs_source = concat!(
+            "enable wgpu_ray_query;\n",
+            include_str!("../graphics/shaders/scene_shading.wgsl"),
+            include_str!("../graphics/shaders/scene_traced_fragment.wgsl"),
+        );
 
         let vs_module = pipeline::compile_shader(device, "scene_vertex", vs_source);
         let fs_module = pipeline::compile_shader(device, "scene_fragment", fs_source);
@@ -441,14 +468,18 @@ impl ScenePipeline {
         let depth_texture = texture::depth_texture(device, "scene_depth", width, height);
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Shared descriptor builder for the pipeline variants: same shaders,
-        // layout and vertex format, differing only in blend state, depth-write and
-        // fragment entry point.
-        let make_pipeline_entry =
-            |label: &str, blend: wgpu::BlendState, depth_write: bool, entry: &str| {
+        // Shared descriptor builder for the pipeline variants: same vertex shader
+        // and vertex format, differing in fragment module, pipeline layout, blend
+        // state, depth-write and fragment entry point.
+        let make_pipeline = |label: &str,
+                             layout: &wgpu::PipelineLayout,
+                             fragment: &wgpu::ShaderModule,
+                             blend: wgpu::BlendState,
+                             depth_write: bool,
+                             entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &vs_module,
                     entry_point: Some("main"),
@@ -456,7 +487,7 @@ impl ScenePipeline {
                     buffers: &[Some(vertex_layout.clone())],
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &fs_module,
+                    module: fragment,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -488,16 +519,20 @@ impl ScenePipeline {
         };
 
         // Opaque: writes depth, no blending (straight overwrite).
-        let opaque_pipeline = make_pipeline_entry(
+        let opaque_pipeline = make_pipeline(
             "scene_pipeline_opaque",
+            &pipeline_layout,
+            &fs_module,
             wgpu::BlendState::REPLACE,
             true,
             "main",
         );
         // Transparent: tested against opaque depth but doesn't write depth itself —
         // relies on back-to-front draw order (see render_batched) instead.
-        let transparent_pipeline = make_pipeline_entry(
+        let transparent_pipeline = make_pipeline(
             "scene_pipeline_transparent",
+            &pipeline_layout,
+            &fs_module,
             wgpu::BlendState::ALPHA_BLENDING,
             false,
             "main",
@@ -506,8 +541,10 @@ impl ScenePipeline {
         // the transparent surface pass. Alpha blending alone can only fade the
         // background toward the glass colour; multiplying is what actually filters
         // it, so objects seen through coloured glass take on its hue.
-        let glass_tint_pipeline = make_pipeline_entry(
+        let glass_tint_pipeline = make_pipeline(
             "scene_pipeline_glass_tint",
+            &pipeline_layout,
+            &fs_module,
             wgpu::BlendState {
                 color: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::Dst,
@@ -523,6 +560,28 @@ impl ScenePipeline {
             false,
             "tint",
         );
+
+        // Traced: one pipeline for every material. Compiled only when the caller
+        // supplied a ray-tracing layout, because the WGSL contains ray queries
+        // that a device without the feature cannot even parse.
+        let traced_pipeline = traced_layout.map(|traced_layout| {
+            let traced_fs_module =
+                pipeline::compile_shader(device, "scene_traced_fragment", traced_fs_source);
+            let traced_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("scene_traced_pipeline_layout"),
+                    bind_group_layouts: &[Some(&bind_group_layout), Some(traced_layout)],
+                    immediate_size: 0,
+                });
+            make_pipeline(
+                "scene_pipeline_traced",
+                &traced_pipeline_layout,
+                &traced_fs_module,
+                wgpu::BlendState::REPLACE,
+                true,
+                "main",
+            )
+        });
 
         // Shadow pass: depth-only, rendered from light[0]'s point of view.
         let shadow_bind_group_layout =
@@ -613,6 +672,7 @@ impl ScenePipeline {
             opaque_pipeline,
             transparent_pipeline,
             glass_tint_pipeline,
+            traced_pipeline,
             vp_buffer,
             lights_meta_buffer,
             lights_buffer,
@@ -746,6 +806,12 @@ impl ScenePipeline {
         MAX_OBJECTS
     }
 
+    /// Whether a traced pipeline was built, i.e. whether `render_batched` can
+    /// honour a `Some(traced)` argument.
+    pub fn supports_tracing(&self) -> bool {
+        self.traced_pipeline.is_some()
+    }
+
     /// The scene depth buffer. Exposed for CPU readback: screen-space effects
     /// (SSAO, depth-driven cell subdivision) consume it on the ASCII side.
     pub fn depth_texture(&self) -> &Texture {
@@ -790,6 +856,13 @@ impl ScenePipeline {
     /// `objects` and `materials` must be the same slices passed to
     /// `upload_objects` / `upload_materials` this frame — they are used to
     /// resolve each mesh's world transform and opaque/transparent class.
+    ///
+    /// When `traced` is `Some`, the ray-traced pipeline replaces all three
+    /// rasterised ones: every material goes through a single opaque draw, the
+    /// shadow map pass is skipped (shadow rays replace it), and the glass tint
+    /// pass is skipped (the refraction ray already carries what is behind the
+    /// glass, filtered by its colour). Passing `Some` without having built the
+    /// traced pipeline falls back to rasterising rather than failing.
     pub fn render_batched(
         &mut self,
         device: &Device,
@@ -797,10 +870,12 @@ impl ScenePipeline {
         meshes: &[(Entity, &MeshComponent, u32)],
         objects: &[ObjectUniform],
         materials: &[MaterialUniform],
+        traced: Option<&wgpu::BindGroup>,
     ) -> Result<()> {
         if meshes.is_empty() {
             return Ok(());
         }
+        let traced = traced.filter(|_| self.traced_pipeline.is_some());
 
         // Ensure all meshes have cached buffers.
         for (entity, mesh, _) in meshes {
@@ -820,7 +895,11 @@ impl ScenePipeline {
 
         // Simplified shadow map: depth-only pass from light[0]'s point of view.
         // Must run before the main pass since the fragment shader samples it.
-        self.render_shadow_pass(device, queue, &drawable);
+        // Skipped entirely when tracing: the traced shader never samples the map,
+        // so rendering it would be pure cost.
+        if traced.is_none() {
+            self.render_shadow_pass(device, queue, &drawable);
+        }
 
         // Classify by material transparency; transparent meshes carry their
         // world-space distance to the camera for back-to-front sorting.
@@ -886,30 +965,51 @@ impl ScenePipeline {
 
             rpass.set_bind_group(0, &self.bind_group, &[]);
 
-            rpass.set_pipeline(&self.opaque_pipeline);
-            for (entity, object_index) in &opaque {
-                if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
-                    rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
-                    rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+            if let (Some(traced_group), Some(traced_pipeline)) =
+                (traced, self.traced_pipeline.as_ref())
+            {
+                // One pass, one pipeline, every material. Draw order no longer
+                // matters: nothing is blended, so depth testing alone resolves
+                // occlusion — including glass in front of glass, which the
+                // refraction ray sees through rather than blending against.
+                rpass.set_bind_group(1, traced_group, &[]);
+                rpass.set_pipeline(traced_pipeline);
+                for (entity, object_index) in &drawable {
+                    if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
+                        rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
+                        rpass
+                            .set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                    }
                 }
-            }
+            } else {
+                rpass.set_pipeline(&self.opaque_pipeline);
+                for (entity, object_index) in &opaque {
+                    if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
+                        rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
+                        rpass
+                            .set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                    }
+                }
 
-            // Transparent objects, farthest first. Each one is drawn twice: the
-            // tint pass filters whatever is already behind it, then the surface
-            // pass adds its own shading, reflections and rim. Interleaving the two
-            // per object (rather than doing all tints then all surfaces) keeps the
-            // back-to-front ordering correct when glass overlaps glass.
-            for (entity, object_index, _) in &transparent {
-                if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
-                    rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
-                    rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                // Transparent objects, farthest first. Each one is drawn twice: the
+                // tint pass filters whatever is already behind it, then the surface
+                // pass adds its own shading, reflections and rim. Interleaving the two
+                // per object (rather than doing all tints then all surfaces) keeps the
+                // back-to-front ordering correct when glass overlaps glass.
+                for (entity, object_index, _) in &transparent {
+                    if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
+                        rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
+                        rpass
+                            .set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-                    rpass.set_pipeline(&self.glass_tint_pipeline);
-                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                        rpass.set_pipeline(&self.glass_tint_pipeline);
+                        rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
 
-                    rpass.set_pipeline(&self.transparent_pipeline);
-                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                        rpass.set_pipeline(&self.transparent_pipeline);
+                        rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                    }
                 }
             }
         }

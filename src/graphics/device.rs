@@ -1,8 +1,35 @@
 // Graphics context: wgpu instance, adapter, device, queue, surface.
 
 use crate::engine::core::{block_on, EngineError, Result};
+use crate::graphics::capabilities::{self, RayTracingStatus};
 use wgpu::{Adapter, Device, Instance, Queue, Surface};
 use wgpu::SurfaceConfiguration;
+
+/// Default limits with the acceleration-structure entries raised off zero.
+///
+/// Kept as a free function next to the only call site because it is a property
+/// of *this* engine's needs (one TLAS, one geometry group per BLAS), not a
+/// general capability query.
+fn acceleration_structure_limits(adapter: &wgpu::Limits) -> wgpu::Limits {
+    let mut limits = wgpu::Limits::default();
+    limits.max_tlas_instance_count = capabilities::requested_limit(
+        capabilities::REQUESTED_TLAS_INSTANCES,
+        adapter.max_tlas_instance_count,
+    );
+    limits.max_blas_primitive_count = capabilities::requested_limit(
+        capabilities::REQUESTED_BLAS_PRIMITIVES,
+        adapter.max_blas_primitive_count,
+    );
+    limits.max_blas_geometry_count = capabilities::requested_limit(
+        capabilities::REQUESTED_BLAS_GEOMETRIES,
+        adapter.max_blas_geometry_count,
+    );
+    limits.max_acceleration_structures_per_shader_stage = capabilities::requested_limit(
+        capabilities::REQUESTED_ACCELERATION_STRUCTURES,
+        adapter.max_acceleration_structures_per_shader_stage,
+    );
+    limits
+}
 
 /// Result of asking the surface for a frame.
 pub enum FrameOutcome {
@@ -27,6 +54,9 @@ pub struct GraphicsContext {
     pub config: SurfaceConfiguration,
     pub width: u32,
     pub height: u32,
+    /// Whether hardware ray query is active, and if not, why not. Decided once
+    /// here so no consumer has to re-derive it (see `graphics::capabilities`).
+    ray_tracing: RayTracingStatus,
 }
 
 impl GraphicsContext {
@@ -60,15 +90,66 @@ impl GraphicsContext {
         }))
         .map_err(|e| EngineError::Graphics(e.to_string()))?;
 
+        // Ray query is optional: ask for it only when the adapter advertises it
+        // and the environment has not vetoed it. Requesting an unsupported
+        // feature makes `request_device` fail outright, so the negotiation has
+        // to happen before the request, not after.
+        let ray_query = wgpu::Features::from(wgpu::FeaturesWGPU::EXPERIMENTAL_RAY_QUERY);
+        let adapter_features = adapter.features();
+        let adapter_supports = adapter_features.contains(ray_query);
+        let vetoed = capabilities::ray_tracing_vetoed();
+        let request_ray_query = capabilities::should_request_ray_query(adapter_supports, vetoed);
+
+        let info = adapter.get_info();
+        eprintln!(
+            "gpu: {} ({:?}, {:?}) driver \"{}\"",
+            info.name, info.device_type, info.backend, info.driver_info
+        );
+
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("AstraGlyph Device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
+            required_features: if request_ray_query {
+                ray_query
+            } else {
+                wgpu::Features::empty()
+            },
+            required_limits: if request_ray_query {
+                acceleration_structure_limits(&adapter.limits())
+            } else {
+                wgpu::Limits::default()
+            },
+            // EXPERIMENTAL-prefixed features are gated behind this token; with
+            // the default (disabled) value the RAY_QUERY request above would be
+            // rejected regardless of hardware support.
+            //
+            // SAFETY: the token only acknowledges that wgpu's ray-tracing
+            // implementation is work-in-progress and may contain soundness bugs.
+            // The engine handles that by keeping the rasterised path intact and
+            // switchable at runtime, so a misbehaving driver degrades to the
+            // fallback rather than being the only option.
+            experimental_features: if request_ray_query {
+                unsafe { wgpu::ExperimentalFeatures::enabled() }
+            } else {
+                wgpu::ExperimentalFeatures::disabled()
+            },
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
         }))
         .map_err(|e| EngineError::Graphics(e.to_string()))?;
+
+        // What the *device* granted, not what was asked for: a device may hand
+        // back fewer features than requested, and treating that as success would
+        // send ray queries at a device that cannot run them.
+        // A zero instance budget is as disqualifying as a missing feature: the
+        // TLAS could not hold a single object, so there would be nothing to trace
+        // against even though the ray-query calls themselves would validate.
+        let tlas_capacity = device.limits().max_tlas_instance_count;
+        let granted = device.features().contains(ray_query) && tlas_capacity > 0;
+        let ray_tracing = capabilities::classify(adapter_supports, vetoed, granted);
+        eprintln!(
+            "raytracing: {} (tlas capacity {tlas_capacity})",
+            ray_tracing.describe()
+        );
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -104,7 +185,13 @@ impl GraphicsContext {
             config,
             width,
             height,
+            ray_tracing,
         })
+    }
+
+    /// Whether hardware ray query is active, and if not, why not.
+    pub fn ray_tracing(&self) -> RayTracingStatus {
+        self.ray_tracing
     }
 
     /// Reconfigure the surface after a window resize.
