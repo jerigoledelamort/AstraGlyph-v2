@@ -22,6 +22,9 @@ use wgpu::{Device, Queue, Texture, TextureFormat, TextureView};
 /// Maximum number of materials supported in the storage buffer.
 const MAX_MATERIALS: usize = 256;
 
+/// Maximum number of drawable objects (mesh instances) per frame.
+const MAX_OBJECTS: usize = 1024;
+
 /// Maximum number of simultaneous light sources.
 pub const MAX_LIGHTS: usize = 8;
 
@@ -136,6 +139,36 @@ pub struct CameraUniform {
 
 unsafe impl crate::engine::core::Pod for CameraUniform {}
 
+/// Per-object (per mesh instance) GPU data: its model matrix plus which material
+/// it uses. Indexed in the shaders via `@builtin(instance_index)`.
+///
+/// Model matrix and material index live together — and are looked up by *object*
+/// index rather than material index — because materials are deduplicated
+/// (see `MaterialRegistry`): several objects legitimately share one material
+/// slot, so a material index can no longer identify an object.
+///
+/// 16 floats + u32 + 3 u32 padding = 80 bytes (mat4x4 alignment is 16).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectUniform {
+    pub model: [f32; 16],
+    pub material_index: u32,
+    pub _padding: [u32; 3],
+}
+
+unsafe impl crate::engine::core::Pod for ObjectUniform {}
+
+impl ObjectUniform {
+    /// Build an object entry from a world matrix and a material slot.
+    pub fn new(model: Mat4, material_index: u32) -> Self {
+        Self {
+            model: model.m,
+            material_index,
+            _padding: [0, 0, 0],
+        }
+    }
+}
+
 /// Uniform block for the shadow map: the shadow-casting light's view-projection
 /// matrix. Bound as VERTEX in the shadow pass and as FRAGMENT in the main
 /// scene pass (same buffer, two bind groups).
@@ -167,6 +200,7 @@ pub struct ScenePipeline {
     lights_meta_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     material_buffer: wgpu::Buffer,
+    object_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// Offscreen render target texture (low-resolution).
     pub target_texture: Texture,
@@ -224,6 +258,15 @@ impl ScenePipeline {
         let material_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene_materials"),
             size: (MAX_MATERIALS * std::mem::size_of::<MaterialUniform>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Per-object storage buffer (model matrix + material index), indexed by
+        // instance_index in both the scene and shadow vertex shaders.
+        let object_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene_objects"),
+            size: (MAX_OBJECTS * std::mem::size_of::<ObjectUniform>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -316,6 +359,16 @@ impl ScenePipeline {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -350,6 +403,10 @@ impl ScenePipeline {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: shadow_vp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: object_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -438,24 +495,44 @@ impl ScenePipeline {
         let shadow_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shadow_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    // The shadow pass needs the same model matrices as the scene
+                    // pass, otherwise shadows would be cast by untransformed geometry.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
         let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow_bind_group"),
             layout: &shadow_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: shadow_vp_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: shadow_vp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: object_buffer.as_entire_binding(),
+                },
+            ],
         });
         let shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow_pipeline_layout"),
@@ -506,6 +583,7 @@ impl ScenePipeline {
             lights_meta_buffer,
             lights_buffer,
             material_buffer,
+            object_buffer,
             bind_group,
             target_texture,
             target_view,
@@ -533,13 +611,15 @@ impl ScenePipeline {
     }
 
     /// Render the shadow map: scene depth from light[0]'s point of view.
+    /// Takes the already-resolved `(entity, object_index)` draw list so casters
+    /// are transformed by exactly the same model matrices as the scene pass.
     fn render_shadow_pass(
         &mut self,
         device: &Device,
         queue: &Queue,
-        meshes: &[(Entity, &MeshComponent, u32)],
+        drawable: &[(Entity, u32)],
     ) {
-        if meshes.is_empty() {
+        if drawable.is_empty() {
             return;
         }
 
@@ -567,11 +647,11 @@ impl ScenePipeline {
             rpass.set_pipeline(&self.shadow_pipeline);
             rpass.set_bind_group(0, &self.shadow_bind_group, &[]);
 
-            for (entity, _mesh, _material_index) in meshes {
+            for (entity, object_index) in drawable {
                 if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
                     rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
                     rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..bufs.index_count, 0, 0..1);
+                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
                 }
             }
         }
@@ -616,6 +696,22 @@ impl ScenePipeline {
         }
     }
 
+    /// Upload per-object model matrices + material indices to the GPU.
+    /// Entries beyond `MAX_OBJECTS` are dropped (the corresponding meshes will
+    /// read a stale slot rather than crash — see `render_batched`, which clamps
+    /// the draw list to the same limit).
+    pub fn upload_objects(&self, queue: &Queue, objects: &[ObjectUniform]) {
+        let count = objects.len().min(MAX_OBJECTS);
+        if count > 0 {
+            queue.write_buffer(&self.object_buffer, 0, cast_slice(&objects[..count]));
+        }
+    }
+
+    /// How many objects a single frame can draw (size of the object storage buffer).
+    pub const fn max_objects() -> usize {
+        MAX_OBJECTS
+    }
+
     /// Get or create cached GPU buffers (and centroid) for a mesh.
     fn get_or_create_buffers(
         &mut self,
@@ -648,16 +744,18 @@ impl ScenePipeline {
     /// (depth-tested, depth-written), then transparent meshes sorted
     /// back-to-front and alpha-blended on top.
     ///
-    /// Each mesh is drawn with its material_index as the instance start,
-    /// so the shader can look up the correct material via `instance_index`.
+    /// Each mesh is drawn with its *object* index as the instance start, so the
+    /// shaders can look up its model matrix and material via `instance_index`.
     /// Buffers are cached per-entity: created on first use, reused thereafter.
-    /// `materials` must be the same slice passed to `upload_materials` this
-    /// frame — used to classify each mesh as opaque or transparent.
+    /// `objects` and `materials` must be the same slices passed to
+    /// `upload_objects` / `upload_materials` this frame — they are used to
+    /// resolve each mesh's world transform and opaque/transparent class.
     pub fn render_batched(
         &mut self,
         device: &Device,
         queue: &Queue,
         meshes: &[(Entity, &MeshComponent, u32)],
+        objects: &[ObjectUniform],
         materials: &[MaterialUniform],
     ) -> Result<()> {
         if meshes.is_empty() {
@@ -669,29 +767,44 @@ impl ScenePipeline {
             self.get_or_create_buffers(device, *entity, mesh);
         }
 
+        // Drop anything past the object buffer's capacity rather than letting it
+        // read a slot that was never uploaded.
+        let drawable: Vec<(Entity, u32)> = meshes
+            .iter()
+            .filter(|(_, _, object_index)| (*object_index as usize) < MAX_OBJECTS.min(objects.len()))
+            .map(|(entity, _, object_index)| (*entity, *object_index))
+            .collect();
+        if drawable.is_empty() {
+            return Ok(());
+        }
+
         // Simplified shadow map: depth-only pass from light[0]'s point of view.
         // Must run before the main pass since the fragment shader samples it.
-        self.render_shadow_pass(device, queue, meshes);
+        self.render_shadow_pass(device, queue, &drawable);
 
         // Classify by material transparency; transparent meshes carry their
-        // squared distance to the camera for back-to-front sorting.
+        // world-space distance to the camera for back-to-front sorting.
         let mut opaque: Vec<(Entity, u32)> = Vec::new();
         let mut transparent: Vec<(Entity, u32, f32)> = Vec::new();
-        for (entity, _mesh, material_index) in meshes {
+        for (entity, object_index) in &drawable {
+            let object = &objects[*object_index as usize];
             let is_transparent = materials
-                .get(*material_index as usize)
+                .get(object.material_index as usize)
                 .map(|m| m.transparency > 0.0)
                 .unwrap_or(false);
             if is_transparent {
-                let center = self
+                // The cached centroid is in mesh-local space, so it has to go
+                // through the model matrix before it can be sorted by depth.
+                let local_center = self
                     .buffer_cache
                     .get(&entity.id())
                     .map(|b| b.center)
                     .unwrap_or(Vec3::ZERO);
-                let dist_sq = (center - self.camera_pos).length_squared();
-                transparent.push((*entity, *material_index, dist_sq));
+                let world_center = Mat4::from_cols_array(object.model).transform_point(local_center);
+                let dist_sq = (world_center - self.camera_pos).length_squared();
+                transparent.push((*entity, *object_index, dist_sq));
             } else {
-                opaque.push((*entity, *material_index));
+                opaque.push((*entity, *object_index));
             }
         }
         // Farthest first (back-to-front).
@@ -734,20 +847,20 @@ impl ScenePipeline {
             rpass.set_bind_group(0, &self.bind_group, &[]);
 
             rpass.set_pipeline(&self.opaque_pipeline);
-            for (entity, material_index) in &opaque {
+            for (entity, object_index) in &opaque {
                 if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
                     rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
                     rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..bufs.index_count, 0, *material_index..*material_index + 1);
+                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
                 }
             }
 
             rpass.set_pipeline(&self.transparent_pipeline);
-            for (entity, material_index, _) in &transparent {
+            for (entity, object_index, _) in &transparent {
                 if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
                     rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
                     rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..bufs.index_count, 0, *material_index..*material_index + 1);
+                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
                 }
             }
         }
@@ -812,5 +925,25 @@ mod tests {
     fn lights_meta_uniform_is_pod_sized_correctly() {
         assert_eq!(std::mem::size_of::<LightsMetaUniform>(), 16);
         assert_eq!(std::mem::size_of::<LightUniform>(), 64);
+    }
+
+    #[test]
+    fn object_uniform_layout_matches_wgsl_expectations() {
+        // mat4x4<f32> (64) + u32 (4) + 3 * u32 padding (12) = 80, a multiple of
+        // the 16-byte alignment a mat4x4 member forces on the struct.
+        assert_eq!(std::mem::size_of::<ObjectUniform>(), 80);
+        assert_eq!(std::mem::size_of::<ObjectUniform>() % 16, 0);
+    }
+
+    #[test]
+    fn object_uniform_preserves_model_matrix_and_material() {
+        let model = Mat4::translation(1.0, 2.0, 3.0);
+        let obj = ObjectUniform::new(model, 7);
+        assert_eq!(obj.material_index, 7);
+        // The stored matrix must round-trip so the renderer can re-derive world
+        // positions on the CPU (used for transparent depth sorting).
+        let restored = Mat4::from_cols_array(obj.model);
+        assert_eq!(restored, model);
+        assert_eq!(restored.transform_point(Vec3::ZERO), Vec3::new(1.0, 2.0, 3.0));
     }
 }

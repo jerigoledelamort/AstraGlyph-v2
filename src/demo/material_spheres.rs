@@ -5,11 +5,18 @@
 // - 3 spheres: red (matte), blue (mirror), green (glass)
 //   arranged in a triangle, close enough for mutual influence,
 //   far enough to view from all angles.
-// - Single point light from above (straight down).
+// - A point key light from above plus a weak directional fill light.
+//
+// The spheres' geometry is built once at the origin and placed via
+// TransformComponent, so this scene also exercises the model-matrix path
+// (Phase 2.1) rather than baking world positions into vertex data.
 
-use crate::engine::math::{radians, Vec3, Vec4};
+use crate::engine::math::{radians, Transform, Vec3, Vec4};
 use crate::renderer::LightUniform;
-use crate::scene::{Camera, Entity, MaterialComponent, MeshComponent, Projection, Scene, plane, sphere};
+use crate::scene::{
+    plane, sphere, Camera, Entity, MaterialComponent, MeshComponent, Projection, Scene,
+    TransformComponent,
+};
 
 /// Build the material spheres demo scene.
 ///
@@ -18,54 +25,50 @@ pub fn build_scene() -> (Scene, Camera) {
     let mut scene = Scene::new();
 
     // --- Ground plane (white matte) ---
-    let ground = plane(Vec3::new(0.0, -2.0, 0.0), 50.0, Vec3::new(0.8, 0.8, 0.8));
+    // Built at the origin and lowered by its transform.
+    let ground = plane(Vec3::ZERO, 50.0, Vec3::new(0.8, 0.8, 0.8));
     add_mesh_entity(
         &mut scene,
         ground,
         MaterialComponent::matte(Vec4::new(0.8, 0.8, 0.8, 1.0), 0.15, 0.85),
+        Transform {
+            position: Vec3::new(0.0, -2.0, 0.0),
+            ..Transform::identity()
+        },
     );
 
     // --- Three spheres ---
+    // All three share one unit-radius mesh built at the origin; position and
+    // size come from their transforms.
+    let unit_sphere = |color: Vec3| sphere(Vec3::ZERO, 1.0, color, 24, 32);
+    let placed = |position: Vec3| Transform {
+        position,
+        scale: Vec3::splat(1.5),
+        ..Transform::identity()
+    };
+
     // Red — matte (high diffuse, low specular, low shininess)
-    let red_sphere = sphere(
-        Vec3::new(-2.5, -0.5, 0.0),
-        1.5,
-        Vec3::new(0.85, 0.1, 0.1),
-        24,
-        32,
-    );
     add_mesh_entity(
         &mut scene,
-        red_sphere,
+        unit_sphere(Vec3::new(0.85, 0.1, 0.1)),
         MaterialComponent::matte(Vec4::new(0.85, 0.1, 0.1, 1.0), 0.1, 0.9),
+        placed(Vec3::new(-2.5, -0.5, 0.0)),
     );
 
     // Blue — mirror (high specular, high shininess, high reflectivity)
-    let blue_sphere = sphere(
-        Vec3::new(2.5, -0.5, 0.0),
-        1.5,
-        Vec3::new(0.1, 0.2, 0.85),
-        24,
-        32,
-    );
     add_mesh_entity(
         &mut scene,
-        blue_sphere,
+        unit_sphere(Vec3::new(0.1, 0.2, 0.85)),
         MaterialComponent::mirror(Vec4::new(0.1, 0.2, 0.85, 1.0), 0.8),
+        placed(Vec3::new(2.5, -0.5, 0.0)),
     );
 
     // Green — glass (transparent, refractive, IOR=1.5)
-    let green_sphere = sphere(
-        Vec3::new(0.0, -0.5, -2.5),
-        1.5,
-        Vec3::new(0.1, 0.75, 0.2),
-        24,
-        32,
-    );
     add_mesh_entity(
         &mut scene,
-        green_sphere,
+        unit_sphere(Vec3::new(0.1, 0.75, 0.2)),
         MaterialComponent::glass(Vec4::new(0.1, 0.75, 0.2, 1.0), 1.5, 0.8),
+        placed(Vec3::new(0.0, -0.5, -2.5)),
     );
 
     // --- Camera ---
@@ -96,10 +99,16 @@ pub fn lights() -> Vec<LightUniform> {
     ]
 }
 
-/// Add a mesh + material entity to the scene.
-fn add_mesh_entity(scene: &mut Scene, mesh: MeshComponent, material: MaterialComponent) -> Entity {
+/// Add a mesh + material + transform entity to the scene.
+fn add_mesh_entity(
+    scene: &mut Scene,
+    mesh: MeshComponent,
+    material: MaterialComponent,
+    transform: Transform,
+) -> Entity {
     let entity = scene.create_entity();
     scene.add_component(entity, mesh);
     scene.add_component(entity, material);
+    scene.add_component(entity, TransformComponent { local: transform });
     entity
 }

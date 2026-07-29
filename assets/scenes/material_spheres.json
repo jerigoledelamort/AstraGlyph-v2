@@ -1,0 +1,132 @@
+{
+  "name": "material_spheres",
+  "camera": {
+    "position": [0.0, 3.0, 8.0],
+    "target": [0.0, -0.5, 0.0],
+    "up": [0.0, 1.0, 0.0],
+    "projection": {
+      "type": "perspective",
+      "fov_y_degrees": 60.0,
+      "aspect": 1.7777778,
+      "near": 0.1,
+      "far": 200.0
+    }
+  },
+  "lights": [
+    {
+      "type": "point",
+      "position": [0.0, 10.0, 0.0],
+      "color": [1.0, 1.0, 1.0],
+      "ambient": 0.1,
+      "intensity": 1.0
+    },
+    {
+      "type": "directional",
+      "direction": [0.4, -0.3, 0.6],
+      "color": [0.4, 0.45, 0.6],
+      "ambient": 0.05,
+      "intensity": 0.35
+    }
+  ],
+  "entities": [
+    {
+      "name": "ground",
+      "transform": {
+        "position": [0.0, -2.0, 0.0]
+      },
+      "mesh": {
+        "type": "plane",
+        "size": 50.0,
+        "color": [0.8, 0.8, 0.8]
+      },
+      "material": {
+        "type": "matte",
+        "color": [0.8, 0.8, 0.8, 1.0],
+        "ambient": 0.15,
+        "diffuse": 0.85
+      }
+    },
+    {
+      "name": "red_sphere_matte",
+      "transform": {
+        "position": [-2.5, -0.5, 0.0],
+        "scale": [1.5, 1.5, 1.5]
+      },
+      "mesh": {
+        "type": "sphere",
+        "radius": 1.0,
+        "color": [0.85, 0.1, 0.1],
+        "rings": 24,
+        "segments": 32
+      },
+      "material": {
+        "type": "matte",
+        "color": [0.85, 0.1, 0.1, 1.0],
+        "ambient": 0.1,
+        "diffuse": 0.9
+      }
+    },
+    {
+      "name": "blue_sphere_mirror",
+      "transform": {
+        "position": [2.5, -0.5, 0.0],
+        "scale": [1.5, 1.5, 1.5]
+      },
+      "mesh": {
+        "type": "sphere",
+        "radius": 1.0,
+        "color": [0.1, 0.2, 0.85],
+        "rings": 24,
+        "segments": 32
+      },
+      "material": {
+        "type": "mirror",
+        "color": [0.1, 0.2, 0.85, 1.0],
+        "reflectivity": 0.8
+      },
+      "children": [
+        {
+          "name": "satellite_of_blue_sphere",
+          "comment": "transform is relative to the parent: 1.6 units up in the parent's (already 1.5x scaled) space",
+          "transform": {
+            "position": [0.0, 1.6, 0.0],
+            "scale": [0.3, 0.3, 0.3]
+          },
+          "mesh": {
+            "type": "sphere",
+            "radius": 1.0,
+            "color": [0.95, 0.8, 0.2],
+            "rings": 16,
+            "segments": 24
+          },
+          "material": {
+            "type": "matte",
+            "color": [0.95, 0.8, 0.2, 1.0],
+            "ambient": 0.15,
+            "diffuse": 0.85
+          }
+        }
+      ]
+    },
+    {
+      "name": "green_sphere_glass",
+      "transform": {
+        "position": [0.0, -0.5, -2.5],
+        "scale": [1.5, 1.5, 1.5]
+      },
+      "mesh": {
+        "type": "sphere",
+        "radius": 1.0,
+        "color": [0.1, 0.75, 0.2],
+        "rings": 24,
+        "segments": 32
+      },
+      "material": {
+        "type": "glass",
+        "color": [0.1, 0.75, 0.2, 1.0],
+        "ior": 1.5,
+        "transparency": 0.8
+      }
+    }
+  ]
+}

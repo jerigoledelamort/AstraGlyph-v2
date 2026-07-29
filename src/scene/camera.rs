@@ -26,6 +26,33 @@ impl Projection {
         Self::Perspective { fov_y, aspect, near, far }
     }
 
+    /// Orthographic projection from explicit frustum bounds.
+    pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Self {
+        Self::Orthographic { left, right, bottom, top, near, far }
+    }
+
+    /// Orthographic projection sized by vertical extent and aspect ratio —
+    /// the ergonomic form, mirroring how `perspective` is usually called.
+    ///
+    /// `height` is the total world-space height covered by the viewport.
+    pub fn orthographic_sized(height: f32, aspect: f32, near: f32, far: f32) -> Self {
+        let half_h = height * 0.5;
+        let half_w = half_h * aspect;
+        Self::Orthographic {
+            left: -half_w,
+            right: half_w,
+            bottom: -half_h,
+            top: half_h,
+            near,
+            far,
+        }
+    }
+
+    /// Whether this projection is orthographic.
+    pub fn is_orthographic(&self) -> bool {
+        matches!(self, Self::Orthographic { .. })
+    }
+
     pub fn to_matrix(&self) -> Mat4 {
         match self {
             Self::Perspective { fov_y, aspect, near, far } => {
@@ -78,9 +105,27 @@ impl Camera {
     }
 
     /// Update aspect ratio on resize.
+    ///
+    /// Orthographic cameras keep their vertical extent and widen/narrow
+    /// horizontally, so a window resize does not stretch the scene.
     pub fn set_aspect(&mut self, aspect: f32) {
-        if let Projection::Perspective { fov_y, near, far, .. } = self.projection {
-            self.projection = Projection::Perspective { fov_y, aspect, near, far };
+        match self.projection {
+            Projection::Perspective { fov_y, near, far, .. } => {
+                self.projection = Projection::Perspective { fov_y, aspect, near, far };
+            }
+            Projection::Orthographic { bottom, top, near, far, .. } => {
+                let half_h = (top - bottom) * 0.5;
+                let center_y = (top + bottom) * 0.5;
+                let half_w = half_h * aspect;
+                self.projection = Projection::Orthographic {
+                    left: -half_w,
+                    right: half_w,
+                    bottom: center_y - half_h,
+                    top: center_y + half_h,
+                    near,
+                    far,
+                };
+            }
         }
     }
 }
@@ -117,6 +162,49 @@ mod tests {
         assert!((f - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5);
         let r = cam.right();
         assert!((r - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn projection_orthographic_sized_matches_explicit_bounds() {
+        let sized = Projection::orthographic_sized(10.0, 2.0, 0.1, 100.0);
+        let explicit = Projection::orthographic(-10.0, 10.0, -5.0, 5.0, 0.1, 100.0);
+        assert_eq!(sized, explicit);
+        assert!(sized.is_orthographic());
+        assert!(!Projection::perspective(radians(60.0), 1.0, 0.1, 100.0).is_orthographic());
+    }
+
+    #[test]
+    fn orthographic_camera_projects_without_perspective_divide() {
+        // Two points at different depths but the same x should land on the same
+        // NDC x under an orthographic projection (unlike perspective).
+        let cam = Camera::new(
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::ZERO,
+            Vec3::UNIT_Y,
+            Projection::orthographic_sized(10.0, 1.0, 0.1, 100.0),
+        );
+        let vp = cam.view_projection();
+        let near_pt = vp.transform_point(Vec3::new(2.0, 0.0, 0.0));
+        let far_pt = vp.transform_point(Vec3::new(2.0, 0.0, -5.0));
+        assert!((near_pt.x - far_pt.x).abs() < 1e-5);
+    }
+
+    #[test]
+    fn set_aspect_on_orthographic_preserves_height() {
+        let mut cam = Camera::new(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::UNIT_Y,
+            Projection::orthographic_sized(8.0, 1.0, 0.1, 100.0),
+        );
+        cam.set_aspect(2.0);
+        match cam.projection {
+            Projection::Orthographic { left, right, bottom, top, .. } => {
+                assert!((top - bottom - 8.0).abs() < 1e-5, "height must be preserved");
+                assert!((right - left - 16.0).abs() < 1e-5, "width must follow the aspect");
+            }
+            _ => panic!("expected orthographic"),
+        }
     }
 
     #[test]

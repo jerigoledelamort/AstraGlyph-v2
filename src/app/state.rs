@@ -3,93 +3,163 @@
 
 use std::time::Instant;
 use crate::engine::core::Result;
-use crate::engine::math::{radians, Vec3};
+use crate::engine::math::{Mat4, Vec3};
 use crate::graphics::GraphicsContext;
-use crate::renderer::{AsciiProcessor, CompositePipeline, ScenePipeline};
-use crate::scene::{Camera, MeshComponent, MaterialComponent, MaterialUniform, Scene};
+use crate::renderer::{AsciiProcessor, CompositePipeline, LightUniform, ObjectUniform, ScenePipeline};
+use crate::scene::{
+    Aabb, Camera, CameraMode, CameraRig, Entity, Frustum, Hierarchy, MaterialComponent,
+    MaterialRegistry, MeshComponent, Scene, TransformComponent,
+};
 use crate::demo::material_spheres;
 
 use super::input::InputState;
 use super::metrics::FrameMetrics;
 
-/// First-person camera controller parameters.
-struct CameraController {
+use winit::keyboard::KeyCode;
+
+/// Translates raw input into `CameraRig` commands.
+///
+/// The rig (scene/camera_rig.rs) owns the actual camera state — orientation,
+/// pivot, mode and dampening. This struct only decides which keys and mouse
+/// motions map to which rig calls, so camera behaviour stays testable without
+/// any winit dependency.
+struct CameraInput {
     /// Movement speed (units per second).
     move_speed: f32,
     /// Mouse look sensitivity.
     look_sensitivity: f32,
-    /// Current yaw (horizontal angle) in radians.
-    yaw: f32,
-    /// Current pitch (vertical angle) in radians.
-    pitch: f32,
+    /// Latch for the preset-cycling key so one press cycles exactly once.
+    cycle_key_was_down: bool,
 }
 
-impl CameraController {
+impl CameraInput {
     fn new() -> Self {
         Self {
             move_speed: 15.0,
             look_sensitivity: 0.0025,
-            yaw: 0.0,
-            pitch: 0.0,
+            cycle_key_was_down: false,
         }
     }
 
-    /// Update camera position and orientation from input.
-    fn update(&mut self, camera: &mut Camera, input: &mut InputState, dt: f32) {
-        // Mouse look (only when LMB is held).
+    /// Feed one frame of input into the rig, then advance its smoothing.
+    fn update(&mut self, rig: &mut CameraRig, input: &mut InputState, dt: f32) {
+        // Mouse look (only when LMB is held). The delta is consumed either way,
+        // otherwise it would accumulate and snap the view on the next click.
+        let (dx, dy) = input.take_mouse_delta();
         if input.is_look_active() {
-            let (dx, dy) = input.take_mouse_delta();
-            self.yaw -= dx as f32 * self.look_sensitivity;
-            self.pitch -= dy as f32 * self.look_sensitivity;
-            // Clamp pitch to avoid flipping.
-            self.pitch = self.pitch.clamp(-radians(89.0), radians(89.0));
-        } else {
-            // Consume delta to prevent accumulation.
-            let _ = input.take_mouse_delta();
+            rig.rotate(
+                -(dx as f32) * self.look_sensitivity,
+                -(dy as f32) * self.look_sensitivity,
+            );
         }
 
-        // Compute forward and right vectors from yaw/pitch.
-        let forward = Vec3::new(
-            self.yaw.cos() * self.pitch.cos(),
-            self.pitch.sin(),
-            -self.yaw.sin() * self.pitch.cos(),
-        );
-        let right = Vec3::new(
-            self.yaw.sin(),
-            0.0,
-            self.yaw.cos(),
-        );
+        // Wheel zooms in the orbit/third-person presets.
+        let wheel = input.take_mouse_wheel();
+        if wheel != 0.0 {
+            rig.zoom(-wheel);
+        }
 
-        // WASD movement.
+        // C cycles the camera presets (edge-triggered).
+        let cycle_down = input.is_key_pressed(KeyCode::KeyC);
+        if cycle_down && !self.cycle_key_was_down {
+            rig.set_mode(next_mode(rig.mode()));
+        }
+        self.cycle_key_was_down = cycle_down;
+
+        // WASD moves the pivot along the rig's own basis vectors.
+        let forward = rig.forward();
+        let right = rig.right();
         let mut move_dir = Vec3::ZERO;
-        if input.is_key_pressed(winit::keyboard::KeyCode::KeyW) {
+        if input.is_key_pressed(KeyCode::KeyW) {
             move_dir += forward;
         }
-        if input.is_key_pressed(winit::keyboard::KeyCode::KeyS) {
+        if input.is_key_pressed(KeyCode::KeyS) {
             move_dir -= forward;
         }
-        if input.is_key_pressed(winit::keyboard::KeyCode::KeyA) {
+        if input.is_key_pressed(KeyCode::KeyA) {
             move_dir -= right;
         }
-        if input.is_key_pressed(winit::keyboard::KeyCode::KeyD) {
+        if input.is_key_pressed(KeyCode::KeyD) {
             move_dir += right;
         }
-        // Vertical movement.
-        if input.is_key_pressed(winit::keyboard::KeyCode::ShiftLeft) {
+        if input.is_key_pressed(KeyCode::ShiftLeft) {
             move_dir += Vec3::UNIT_Y;
         }
-        if input.is_key_pressed(winit::keyboard::KeyCode::ControlLeft) {
+        if input.is_key_pressed(KeyCode::ControlLeft) {
             move_dir -= Vec3::UNIT_Y;
         }
-
         if move_dir.length_squared() > 0.0 {
-            move_dir = move_dir.normalize() * self.move_speed * dt;
-            camera.position += move_dir;
+            rig.move_pivot(move_dir.normalize() * self.move_speed * dt);
         }
 
-        // Update camera target to look in the forward direction.
-        camera.target = camera.position + forward;
+        rig.update(dt);
     }
+}
+
+/// Cycle order for the preset key: first-person -> third-person -> orbit.
+fn next_mode(current: CameraMode) -> CameraMode {
+    match current {
+        CameraMode::FirstPerson => CameraMode::ThirdPerson {
+            distance: 8.0,
+            height_offset: 2.0,
+        },
+        CameraMode::ThirdPerson { .. } => CameraMode::Orbit { distance: 10.0 },
+        CameraMode::Orbit { .. } => CameraMode::FirstPerson,
+    }
+}
+
+/// Build a first-person rig that reproduces an existing camera's viewpoint.
+///
+/// The rig stores orientation as yaw/pitch, so they have to be recovered from
+/// the camera's look direction. Inverting the rig's own convention
+/// (`forward = (cos yaw cos pitch, sin pitch, -sin yaw cos pitch)`) gives
+/// `yaw = atan2(-z, x)` and `pitch = asin(y)`. The rig is snapped so the first
+/// frame shows the scene from where the scene file asked, with no fly-in.
+fn seed_rig_from_camera(camera: &Camera) -> CameraRig {
+    let mut rig = CameraRig::new(CameraMode::FirstPerson);
+    rig.set_pivot(camera.position);
+    let dir = camera.forward();
+    rig.set_yaw_pitch((-dir.z).atan2(dir.x), dir.y.clamp(-1.0, 1.0).asin());
+    rig.snap();
+    rig
+}
+
+/// Scene file the demo starts with, resolved relative to the working directory
+/// first (so an edited file is picked up by `cargo run`) and then relative to
+/// the crate root (so it also works when launched from elsewhere).
+const STARTUP_SCENE: &str = "assets/scenes/material_spheres.json";
+
+/// Load the startup scene from disk, falling back to the code-built demo scene
+/// if the file is missing or malformed. The fallback keeps the engine runnable
+/// while a scene file is being edited; which path was taken is logged so a
+/// silent fallback can't be mistaken for a successful load.
+fn load_startup_scene() -> (Scene, Camera, Vec<LightUniform>, Hierarchy) {
+    let candidates = [
+        std::path::PathBuf::from(STARTUP_SCENE),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(STARTUP_SCENE),
+    ];
+
+    for path in &candidates {
+        if !path.exists() {
+            continue;
+        }
+        match crate::scene::load_scene_file(path) {
+            Ok(loaded) => {
+                eprintln!(
+                    "scene: loaded \"{}\" from {} ({} lights)",
+                    loaded.name,
+                    path.display(),
+                    loaded.lights.len()
+                );
+                return (loaded.scene, loaded.camera, loaded.lights, loaded.hierarchy);
+            }
+            Err(e) => eprintln!("scene: failed to load {}: {e}", path.display()),
+        }
+    }
+
+    eprintln!("scene: falling back to the built-in material_spheres demo");
+    let (scene, camera) = material_spheres::build_scene();
+    (scene, camera, material_spheres::lights(), Hierarchy::new())
 }
 
 /// Main application state.
@@ -99,14 +169,25 @@ pub struct AppState {
     composite_pipeline: CompositePipeline,
     ascii_processor: AsciiProcessor,
     camera: Camera,
-    camera_controller: CameraController,
+    camera_rig: CameraRig,
+    camera_input: CameraInput,
     input: InputState,
     scene: Scene,
+    /// Parent/child links between entities; world matrices are composed through
+    /// this each frame.
+    hierarchy: Hierarchy,
+    /// Lights for the active scene (from the scene file, or the demo defaults).
+    lights: Vec<LightUniform>,
+    /// Deduplicating material store, rebuilt each frame.
+    materials: MaterialRegistry,
     last_frame: Instant,
     metrics: FrameMetrics,
     /// Grid resolution (matches the ASCII cell grid).
     grid_cols: u32,
     grid_rows: u32,
+    /// Culling stats for the current frame, logged alongside the FPS line.
+    drawn_count: usize,
+    culled_count: usize,
 }
 
 impl AppState {
@@ -143,7 +224,9 @@ impl AppState {
             grid_rows,
         );
 
-        let (scene, camera) = material_spheres::build_scene();
+        let (scene, camera, lights, hierarchy) = load_startup_scene();
+
+        let camera_rig = seed_rig_from_camera(&camera);
 
         Ok(Self {
             graphics,
@@ -151,13 +234,19 @@ impl AppState {
             composite_pipeline,
             ascii_processor,
             camera,
-            camera_controller: CameraController::new(),
+            camera_rig,
+            camera_input: CameraInput::new(),
             input: InputState::new(),
             scene,
+            hierarchy,
+            lights,
+            materials: MaterialRegistry::new(),
             last_frame: Instant::now(),
             metrics: FrameMetrics::new(),
             grid_cols,
             grid_rows,
+            drawn_count: 0,
+            culled_count: 0,
         })
     }
 
@@ -183,48 +272,83 @@ impl AppState {
         // Begin metrics tracking.
         self.metrics.begin_frame();
 
-        // Update camera from input.
-        self.camera_controller.update(&mut self.camera, &mut self.input, dt);
+        // Drive the camera rig from input, then write its smoothed state into
+        // the camera (its projection is left alone).
+        self.camera_input.update(&mut self.camera_rig, &mut self.input, dt);
+        self.camera_rig.apply_to(&mut self.camera);
 
         // Update scene uniforms.
         self.scene_pipeline.update_camera(&self.graphics.queue, &self.camera);
-        let lights = material_spheres::lights();
-        self.scene_pipeline.update_lights(&self.graphics.queue, &lights);
+        self.scene_pipeline.update_lights(&self.graphics.queue, &self.lights);
 
-        // Collect all meshes with their material indices for batched rendering,
-        // and the scene's world-space bounding box (needed to size the shadow
-        // camera's frustum around whatever geometry is actually on screen).
-        // Material index = position in the materials vec, matching the storage buffer.
+        // Collect the draw list: one object per visible mesh entity, carrying its
+        // model matrix (from TransformComponent, identity when absent) and
+        // deduplicated material slot. Meshes whose world-space bounds fall
+        // outside the camera frustum are skipped entirely.
+        //
+        // The scene's world-space bounds are accumulated over ALL meshes, not
+        // just the visible ones, so the shadow frustum stays stable while the
+        // camera turns — otherwise off-screen casters would stop shadowing.
+        let frustum = Frustum::from_view_projection(&self.camera.view_projection());
         let mesh_entities = self.scene.entities_with::<MeshComponent>();
-        let mut meshes: Vec<(_, _, u32)> = Vec::new();
-        let mut materials: Vec<MaterialUniform> = Vec::new();
-        let mut scene_min = Vec3::splat(f32::INFINITY);
-        let mut scene_max = Vec3::splat(f32::NEG_INFINITY);
-        for entity in mesh_entities {
-            if let Some(mesh) = self.scene.get_component::<MeshComponent>(entity) {
-                let mat_idx = if let Some(mat) = self.scene.get_component::<MaterialComponent>(entity) {
-                    let idx = materials.len() as u32;
-                    materials.push(MaterialUniform::from(mat));
-                    idx
-                } else {
-                    0
-                };
-                for v in &mesh.vertices {
-                    scene_min = Vec3::new(scene_min.x.min(v.position.x), scene_min.y.min(v.position.y), scene_min.z.min(v.position.z));
-                    scene_max = Vec3::new(scene_max.x.max(v.position.x), scene_max.y.max(v.position.y), scene_max.z.max(v.position.z));
-                }
-                meshes.push((entity, mesh, mat_idx));
-            }
-        }
 
-        // Upload materials to GPU.
+        // Compose world matrices through the parent/child graph in one memoized
+        // pass, so a deep chain isn't re-walked per node.
+        let scene_ref = &self.scene;
+        let local_of = |e: Entity| {
+            scene_ref
+                .get_component::<TransformComponent>(e)
+                .map(|t| t.world_matrix())
+                .unwrap_or(Mat4::IDENTITY)
+        };
+        let world_matrices = self.hierarchy.world_matrices(&mesh_entities, &local_of);
+
+        let mut meshes: Vec<(_, _, u32)> = Vec::new();
+        let mut objects: Vec<ObjectUniform> = Vec::new();
+        self.materials.clear();
+        let mut scene_bounds: Option<Aabb> = None;
+        let mut culled = 0usize;
+        for (entity, model) in world_matrices {
+            let Some(mesh) = self.scene.get_component::<MeshComponent>(entity) else {
+                continue;
+            };
+
+            // World-space bounds: local AABB of the mesh, then transformed.
+            let Some(local_bounds) = Aabb::from_points(mesh.vertices.iter().map(|v| v.position))
+            else {
+                continue; // empty mesh — nothing to draw or bound
+            };
+            let world_bounds = local_bounds.transformed(&model);
+            scene_bounds = Some(match scene_bounds {
+                Some(acc) => acc.merge(&world_bounds),
+                None => world_bounds,
+            });
+
+            if !frustum.intersects_aabb(&world_bounds) {
+                culled += 1;
+                continue;
+            }
+
+            let material_index = match self.scene.get_component::<MaterialComponent>(entity) {
+                Some(mat) => self.materials.register(mat),
+                None => self.materials.register(&MaterialComponent::default()),
+            };
+
+            let object_index = objects.len() as u32;
+            objects.push(ObjectUniform::new(model, material_index));
+            meshes.push((entity, mesh, object_index));
+        }
+        self.drawn_count = meshes.len();
+        self.culled_count = culled;
+
+        // Upload per-object transforms and deduplicated materials to the GPU.
+        self.scene_pipeline.upload_objects(&self.graphics.queue, &objects);
+        let materials = self.materials.uniforms().to_vec();
         self.scene_pipeline.upload_materials(&self.graphics.queue, &materials);
 
         // Point the (simplified) shadow camera at light[0], sized to fit the scene.
-        if let (Some(light0), true) = (lights.first(), scene_min.x.is_finite()) {
-            let center = (scene_min + scene_max) * 0.5;
-            let radius = (scene_max - scene_min).length() * 0.5;
-            let light_vp = light0.shadow_view_proj(center, radius);
+        if let (Some(light0), Some(bounds)) = (self.lights.first(), scene_bounds) {
+            let light_vp = light0.shadow_view_proj(bounds.center(), bounds.radius());
             self.scene_pipeline.update_shadow_camera(&self.graphics.queue, light_vp);
         }
 
@@ -234,6 +358,7 @@ impl AppState {
             &self.graphics.device,
             &self.graphics.queue,
             &meshes,
+            &objects,
             &materials,
         )?;
         self.metrics.record_gpu_phase(gpu_start);
@@ -270,6 +395,11 @@ impl AppState {
         self.graphics.queue.present(frame);
 
         // Finalize metrics and log if ready.
+        self.metrics.set_scene_stats(
+            self.drawn_count,
+            self.culled_count,
+            self.materials.len(),
+        );
         self.metrics.end_frame();
 
         Ok(())
@@ -277,5 +407,87 @@ impl AppState {
 
     pub fn fps(&self) -> f32 {
         self.metrics.fps()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::math::radians;
+    use crate::scene::Projection;
+
+    fn camera_looking(from: Vec3, at: Vec3) -> Camera {
+        Camera::new(
+            from,
+            at,
+            Vec3::UNIT_Y,
+            Projection::perspective(radians(60.0), 16.0 / 9.0, 0.1, 200.0),
+        )
+    }
+
+    /// The rig must reproduce the camera it was seeded from, otherwise a scene
+    /// file's authored viewpoint silently changes on startup.
+    #[test]
+    fn seeded_rig_reproduces_the_original_view_direction() {
+        for (from, at) in [
+            (Vec3::new(0.0, 3.0, 8.0), Vec3::new(0.0, -0.5, 0.0)),
+            (Vec3::new(-5.0, 1.0, -5.0), Vec3::ZERO),
+            (Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO),
+            (Vec3::new(7.0, 2.0, 0.0), Vec3::new(0.0, 2.0, 0.0)),
+        ] {
+            let original = camera_looking(from, at);
+            let rig = seed_rig_from_camera(&original);
+
+            assert!(
+                (rig.position() - from).length() < 1e-4,
+                "first-person rig must sit at the camera position (from {from})"
+            );
+
+            let mut rebuilt = camera_looking(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0));
+            rig.apply_to(&mut rebuilt);
+            let want = original.forward();
+            let got = rebuilt.forward();
+            assert!(
+                (want - got).length() < 1e-4,
+                "look direction drifted: wanted {want}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn seeding_preserves_the_camera_projection() {
+        let original = camera_looking(Vec3::new(0.0, 3.0, 8.0), Vec3::ZERO);
+        let rig = seed_rig_from_camera(&original);
+        let mut target = Camera::new(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::UNIT_Y,
+            Projection::orthographic_sized(10.0, 1.0, 0.1, 50.0),
+        );
+        rig.apply_to(&mut target);
+        assert!(
+            target.projection.is_orthographic(),
+            "apply_to must not overwrite the projection"
+        );
+    }
+
+    #[test]
+    fn straight_down_look_does_not_produce_nan() {
+        // asin() at the poles is the classic NaN trap for yaw/pitch recovery.
+        let original = camera_looking(Vec3::new(0.0, 5.0, 0.0), Vec3::ZERO);
+        let rig = seed_rig_from_camera(&original);
+        assert!(rig.yaw().is_finite() && rig.pitch().is_finite());
+        assert!(rig.position().x.is_finite() && rig.position().y.is_finite());
+    }
+
+    #[test]
+    fn camera_mode_cycle_visits_every_preset_and_returns() {
+        let start = CameraMode::FirstPerson;
+        let third = next_mode(start);
+        let orbit = next_mode(third);
+        let back = next_mode(orbit);
+        assert!(matches!(third, CameraMode::ThirdPerson { .. }));
+        assert!(matches!(orbit, CameraMode::Orbit { .. }));
+        assert!(matches!(back, CameraMode::FirstPerson));
     }
 }

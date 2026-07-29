@@ -17,6 +17,11 @@ pub struct FrameMetrics {
     fps: f32,
     /// Last time we logged to stderr.
     last_log: Instant,
+    /// Scene stats for the current frame: meshes drawn, meshes frustum-culled,
+    /// distinct materials uploaded.
+    drawn: usize,
+    culled: usize,
+    material_slots: usize,
 }
 
 impl FrameMetrics {
@@ -29,7 +34,17 @@ impl FrameMetrics {
             fps_accum: 0.0,
             fps: 0.0,
             last_log: Instant::now(),
+            drawn: 0,
+            culled: 0,
+            material_slots: 0,
         }
+    }
+
+    /// Record this frame's scene stats, shown on the periodic log line.
+    pub fn set_scene_stats(&mut self, drawn: usize, culled: usize, material_slots: usize) {
+        self.drawn = drawn;
+        self.culled = culled;
+        self.material_slots = material_slots;
     }
 
     /// Call at the beginning of render().
@@ -60,10 +75,13 @@ impl FrameMetrics {
         if self.fps_accum >= 1.0 {
             self.fps = self.frame_count as f32 / self.fps_accum;
             eprintln!(
-                "FPS: {:.0}, CPU: {:.1}ms, GPU: {:.1}ms",
+                "FPS: {:.0}, CPU: {:.1}ms, GPU: {:.1}ms | drawn: {}, culled: {}, materials: {}",
                 self.fps,
                 self.cpu_time_us as f32 / 1000.0,
                 self.gpu_time_us as f32 / 1000.0,
+                self.drawn,
+                self.culled,
+                self.material_slots,
             );
             self.frame_count = 0;
             self.fps_accum = 0.0;
