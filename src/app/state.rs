@@ -4,15 +4,15 @@
 use std::time::Instant;
 use crate::engine::core::Result;
 use crate::ascii::{compute_tiles, ColorMode, Overlay, OverlayCell, SubdivisionPolicy};
-use crate::engine::math::{Mat4, Vec3};
-use crate::graphics::GraphicsContext;
+use crate::engine::math::{degrees, radians, Mat4, Vec3};
+use crate::graphics::{FrameOutcome, GraphicsContext};
 use crate::renderer::{
     post_process, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer, LightUniform,
     ObjectUniform, PostProcessSettings, ScenePipeline,
 };
 use crate::scene::{
     Aabb, Camera, CameraMode, CameraRig, Entity, Frustum, Hierarchy, MaterialComponent,
-    MaterialRegistry, MeshComponent, Scene, TransformComponent,
+    MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
 };
 use crate::demo::material_spheres;
 
@@ -34,6 +34,9 @@ struct CameraInput {
     look_sensitivity: f32,
     /// Latch for the preset-cycling key so one press cycles exactly once.
     cycle_key_was_down: bool,
+    /// Wheel notches that first-person mode wants applied to the camera FOV,
+    /// consumed by the caller after `update`.
+    pending_fov_zoom: f32,
 }
 
 impl CameraInput {
@@ -42,7 +45,16 @@ impl CameraInput {
             move_speed: 15.0,
             look_sensitivity: 0.0025,
             cycle_key_was_down: false,
+            pending_fov_zoom: 0.0,
         }
+    }
+
+    /// Field-of-view change requested by the wheel this frame, in degrees.
+    /// Positive means "zoom in" (narrower FOV).
+    fn take_fov_zoom(&mut self) -> f32 {
+        let z = self.pending_fov_zoom;
+        self.pending_fov_zoom = 0.0;
+        z * 3.0
     }
 
     /// Feed one frame of input into the rig, then advance its smoothing.
@@ -57,10 +69,19 @@ impl CameraInput {
             );
         }
 
-        // Wheel zooms in the orbit/third-person presets.
+        // Wheel zooms. In third-person/orbit that means the rig distance; in
+        // first person the rig has no distance to change (its zoom() is a
+        // documented no-op), so the wheel is reported back to the caller and
+        // applied to the camera's field of view instead — otherwise the wheel
+        // would appear dead in the default preset.
+        self.pending_fov_zoom = 0.0;
         let wheel = input.take_mouse_wheel();
         if wheel != 0.0 {
-            rig.zoom(-wheel);
+            if matches!(rig.mode(), CameraMode::FirstPerson) {
+                self.pending_fov_zoom = wheel;
+            } else {
+                rig.zoom(-wheel);
+            }
         }
 
         // C cycles the camera presets (edge-triggered).
@@ -299,8 +320,12 @@ impl AppState {
         })
     }
 
-    /// Handle a window resize.
+    /// Handle a window resize. A minimized window reports 0x0, which must not
+    /// reach the aspect-ratio maths or the surface configuration.
     pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
         self.graphics.resize(width, height);
         let aspect = width as f32 / height as f32;
         self.camera.set_aspect(aspect);
@@ -312,7 +337,18 @@ impl AppState {
     }
 
     /// Render one frame.
+    ///
+    /// Returns `Ok(())` for frames that were deliberately skipped (minimized or
+    /// occluded window, stale swapchain) — those are ordinary window states, not
+    /// errors, and must not tear the application down.
     pub fn render(&mut self) -> Result<()> {
+        // Nothing to draw into while minimized; also keeps dt from accumulating
+        // into one huge step that would jolt the camera on restore.
+        if !self.graphics.is_renderable() {
+            self.last_frame = Instant::now();
+            return Ok(());
+        }
+
         // Compute delta time.
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
@@ -325,6 +361,21 @@ impl AppState {
         // the camera (its projection is left alone).
         self.camera_input.update(&mut self.camera_rig, &mut self.input, dt);
         self.camera_rig.apply_to(&mut self.camera);
+
+        // First-person wheel zoom acts on the field of view, clamped to a range
+        // that stays usable (no fish-eye, no telescope).
+        let fov_delta = self.camera_input.take_fov_zoom();
+        if fov_delta != 0.0 {
+            if let Projection::Perspective { fov_y, aspect, near, far } = self.camera.projection {
+                let fov_degrees = degrees(fov_y) - fov_delta;
+                self.camera.projection = Projection::perspective(
+                    radians(fov_degrees.clamp(20.0, 100.0)),
+                    aspect,
+                    near,
+                    far,
+                );
+            }
+        }
 
         // G toggles the dynamic cell grid (edge-triggered).
         let grid_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyG);
@@ -532,7 +583,13 @@ impl AppState {
         self.composite_pipeline.update_instances(&self.graphics.queue, &instances);
 
         // Render glyphs to screen (GPU phase 2: composite).
-        let frame = self.graphics.current_frame()?;
+        let frame = match self.graphics.current_frame() {
+            FrameOutcome::Frame(frame) => frame,
+            // Transient surface state (resize, minimize, occlusion, stale
+            // swapchain): the surface was reconfigured, so drop this frame and
+            // try again next tick rather than failing the whole run.
+            FrameOutcome::Skip(_reason) => return Ok(()),
+        };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let gpu_start = Instant::now();

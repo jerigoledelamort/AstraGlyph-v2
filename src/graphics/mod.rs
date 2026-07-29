@@ -5,4 +5,4 @@ pub mod device;
 pub mod pipeline;
 pub mod texture;
 
-pub use device::GraphicsContext;
+pub use device::{FrameOutcome, GraphicsContext};

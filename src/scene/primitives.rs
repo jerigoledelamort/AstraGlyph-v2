@@ -63,9 +63,13 @@ pub fn sphere(
             let first = lat * stride + lon;
             let second = first + stride;
 
-            // Two triangles per quad (CCW winding when viewed from outside).
-            indices.extend_from_slice(&[first, second, first + 1]);
-            indices.extend_from_slice(&[second, second + 1, first + 1]);
+            // Two triangles per quad, wound so the cross-product normal points
+            // OUTWARD (matching the per-vertex normals). The previous order was
+            // inverted, so every sphere was rendered inside-out: back-face
+            // culling kept only the far hemisphere and the lighting was computed
+            // on surfaces facing away from the camera.
+            indices.extend_from_slice(&[first, first + 1, second]);
+            indices.extend_from_slice(&[second, first + 1, second + 1]);
         }
     }
 
@@ -89,7 +93,12 @@ pub fn plane(center: Vec3, size: f32, color: Vec3) -> MeshComponent {
         MeshVertex { position: Vec3::new(x - size, y, z + size), normal: Vec3::UNIT_Y, color },
     ];
 
-    let indices = vec![0, 1, 2, 0, 2, 3];
+    // Winding matters: the pipeline culls back faces with `front_face: Ccw`, so
+    // the triangles must wind counter-clockwise when seen from +Y — i.e. their
+    // cross-product normal has to agree with the +Y normal attribute above.
+    // The naive 0,1,2 / 0,2,3 order produces a DOWNWARD geometric normal, which
+    // made the ground plane invisible from any camera above it.
+    let indices = vec![0, 2, 1, 0, 3, 2];
 
     MeshComponent::new(vertices, indices)
 }
@@ -164,6 +173,41 @@ mod tests {
         let m = plane(Vec3::ZERO, 10.0, Vec3::ONE);
         for v in &m.vertices {
             assert_eq!(v.normal, Vec3::UNIT_Y);
+        }
+    }
+
+    /// Geometric winding must agree with the normal attribute.
+    ///
+    /// This is the check that was missing: `plane_normal_points_up` only looks at
+    /// the normal *attribute*, so a mesh wound the wrong way passed it happily
+    /// while being culled away by the back-face test at render time.
+    #[test]
+    fn every_primitive_triangle_winds_to_match_its_normal() {
+        for mesh in [
+            plane(Vec3::ZERO, 10.0, Vec3::ONE),
+            plane(Vec3::new(1.0, -2.0, 3.0), 4.0, Vec3::ONE),
+            sphere(Vec3::ZERO, 1.0, Vec3::ONE, 6, 8),
+            sphere(Vec3::new(2.0, 0.0, -1.0), 2.5, Vec3::ONE, 4, 5),
+        ] {
+            assert_eq!(mesh.indices.len() % 3, 0, "indices must form whole triangles");
+            for tri in mesh.indices.chunks(3) {
+                let a = mesh.vertices[tri[0] as usize];
+                let b = mesh.vertices[tri[1] as usize];
+                let c = mesh.vertices[tri[2] as usize];
+
+                let geometric = (b.position - a.position).cross(c.position - a.position);
+                if geometric.length_squared() < 1e-12 {
+                    continue; // degenerate triangle (sphere poles) — no winding to check
+                }
+                let geometric = geometric.normalize();
+                // Average the attribute normals of the triangle's corners.
+                let attribute = (a.normal + b.normal + c.normal).normalize();
+
+                assert!(
+                    geometric.dot(attribute) > 0.0,
+                    "triangle {tri:?} winds against its normal: geometric {geometric}, attribute {attribute}"
+                );
+            }
         }
     }
 }

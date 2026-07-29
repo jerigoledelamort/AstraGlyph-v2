@@ -214,12 +214,12 @@ impl AsciiProcessor {
     }
 
     /// Decode the mapped depth bytes into `last_depth`, skipping row padding.
+    /// As with `extract_pixels`, a failed mapping keeps the previous frame rather
+    /// than bringing the application down.
     fn extract_depth(&mut self, slot_index: usize) {
-        let mapped = self.depth_slots[slot_index]
-            .buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("failed to map depth readback buffer for reading");
+        let Ok(mapped) = self.depth_slots[slot_index].buffer.slice(..).get_mapped_range() else {
+            return;
+        };
         let mut depth = Vec::with_capacity((self.width * self.height) as usize);
 
         for row in 0..self.height {
@@ -281,10 +281,16 @@ impl AsciiProcessor {
     }
 
     /// Read the mapped bytes out of `slot_index`'s buffer into `last_pixels`,
-    /// skipping row-padding bytes. Assumes the buffer is currently mapped.
+    /// skipping row-padding bytes.
+    ///
+    /// A failed mapping is not fatal: it happens when the surface or device goes
+    /// through a bad state (resize, minimize, device loss) and the buffer is torn
+    /// down under us. Keeping the previous frame is strictly better than
+    /// panicking the whole application.
     fn extract_pixels(&mut self, slot_index: usize) {
-        let mapped = self.slots[slot_index].buffer.slice(..).get_mapped_range()
-            .expect("failed to map readback buffer for reading");
+        let Ok(mapped) = self.slots[slot_index].buffer.slice(..).get_mapped_range() else {
+            return;
+        };
         let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
 
         for row in 0..self.height {

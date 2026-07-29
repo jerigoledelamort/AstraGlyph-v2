@@ -59,13 +59,18 @@ pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) ->
         // For now, create the view and sampler.
         let glyph_view = glyph_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // NEAREST, not linear. The atlas is a strip of 8x8 bitmap glyphs: each
+        // glyph is only 1/N of the texture width, so linear filtering blends
+        // across glyph boundaries and smears neighbouring characters into each
+        // other. With the 14 shading glyphs that merely looked soft; with a text
+        // font in the same atlas it turns the HUD into unreadable mush.
         let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("glyph_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
