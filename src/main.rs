@@ -100,6 +100,13 @@ impl ApplicationHandler for MainApp {
                     s.input_mut().mouse_button_event(button, mouse_state);
                 }
             }
+            WindowEvent::Focused(false) => {
+                // Releases that happen while another window has focus never reach
+                // us, so anything held right now would stay stuck down forever.
+                if let Some(s) = self.state.borrow_mut().as_mut() {
+                    s.input_mut().clear_all();
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Line deltas come from a wheel, pixel deltas from a trackpad;
                 // normalize both to "notches" so camera zoom feels the same.

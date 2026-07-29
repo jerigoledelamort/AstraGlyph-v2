@@ -305,6 +305,11 @@ pub struct AppState {
     /// Set by the menu's Quit entry or the console's `quit` command; the event
     /// loop polls it so shutdown stays the caller's decision.
     should_exit: bool,
+    /// Last camera position reported by the input trace, so it only logs on
+    /// actual movement instead of once per frame.
+    last_traced_position: Vec3,
+    /// When the trace last printed, used to throttle it.
+    last_trace_log: Instant,
 }
 
 /// Previous state of every key the UI reads, so each press acts once.
@@ -423,6 +428,8 @@ impl AppState {
             console: build_console(),
             ui_keys_down: UiKeyLatches::default(),
             should_exit: false,
+            last_traced_position: Vec3::ZERO,
+            last_trace_log: Instant::now(),
         })
     }
 
@@ -507,6 +514,25 @@ impl AppState {
             self.camera_input.update(&mut self.camera_rig, &mut self.input, dt);
         }
         self.camera_rig.apply_to(&mut self.camera);
+
+        // The consumer half of the input trace: shows whether the camera actually
+        // saw the events, which is what separates "the OS delivered nothing" from
+        // "something swallowed it".
+        if self.input.is_tracing() {
+            // Throttled: at 1500 FPS an unthrottled line per moved frame buries
+            // the very events it is meant to explain.
+            let moved = (self.camera.position - self.last_traced_position).length();
+            if moved > 1e-4 && self.last_trace_log.elapsed().as_millis() >= 200 {
+                eprintln!(
+                    "camera: pos={} yaw={:.3} focus={}",
+                    self.camera.position,
+                    self.camera_rig.yaw(),
+                    self.ui_has_focus()
+                );
+                self.last_traced_position = self.camera.position;
+                self.last_trace_log = Instant::now();
+            }
+        }
 
         // First-person wheel zoom acts on the field of view, clamped to a range
         // that stays usable (no fish-eye, no telescope).
@@ -1150,8 +1176,21 @@ impl AppState {
             &format!("STYLE {}", if self.glyph_style == GlyphStyle::Blocks { "BLOCK" } else { "RAMP" }),
             DIM,
         );
-        self.overlay
-            .draw_text(1, 6, "TAB MENU  ` CONSOLE", DIM);
+        // Say plainly when a UI layer owns the keyboard. A frozen camera with no
+        // explanation reads as a broken build, which is exactly how it was
+        // reported — the state was correct, it just was not visible anywhere.
+        if self.ui_has_focus() {
+            let owner = if self.console.is_open() { "CONSOLE" } else { "MENU" };
+            self.overlay.draw_text(
+                1,
+                6,
+                &format!("{owner} HAS FOCUS - ESC TO CLOSE"),
+                [1.0, 0.75, 0.3],
+            );
+        } else {
+            self.overlay
+                .draw_text(1, 6, "TAB MENU  ` CONSOLE", DIM);
+        }
 
         // Crosshair at the centre of the grid.
         let (cx, cy) = (self.grid_cols / 2, self.grid_rows / 2);
@@ -1273,6 +1312,77 @@ mod tests {
         let rig = seed_rig_from_camera(&original);
         assert!(rig.yaw().is_finite() && rig.pitch().is_finite());
         assert!(rig.position().x.is_finite() && rig.position().y.is_finite());
+    }
+
+    /// Movement keys must actually move the rig. This is the plumbing the UI
+    /// integration could silently cut: if focus handling or key snapshotting
+    /// swallowed WASD, everything would still compile and render.
+    #[test]
+    fn wasd_moves_the_rig_pivot() {
+        use winit::event::ElementState;
+
+        let mut rig = CameraRig::new(CameraMode::FirstPerson);
+        rig.set_pivot(Vec3::ZERO);
+        rig.set_yaw_pitch(0.0, 0.0);
+        rig.snap();
+        let start = rig.pivot();
+
+        let mut input = InputState::new();
+        let mut camera_input = CameraInput::new();
+
+        input.key_event(KeyCode::KeyW, ElementState::Pressed);
+        for _ in 0..10 {
+            camera_input.update(&mut rig, &mut input, 1.0 / 60.0);
+        }
+
+        let moved = rig.pivot() - start;
+        assert!(
+            moved.length() > 0.1,
+            "W should move the pivot, moved by {} units",
+            moved.length()
+        );
+
+        // Releasing must stop the motion.
+        input.key_event(KeyCode::KeyW, ElementState::Released);
+        let held = rig.pivot();
+        for _ in 0..10 {
+            camera_input.update(&mut rig, &mut input, 1.0 / 60.0);
+        }
+        assert!(
+            (rig.pivot() - held).length() < 1e-3,
+            "pivot kept moving after the key was released"
+        );
+    }
+
+    /// Mouse look must reach the rig while the look button is held, and be
+    /// ignored otherwise.
+    #[test]
+    fn mouse_look_rotates_only_while_the_button_is_held() {
+        use winit::event::{ElementState, MouseButton};
+
+        let mut rig = CameraRig::new(CameraMode::FirstPerson);
+        rig.set_yaw_pitch(0.0, 0.0);
+        rig.snap();
+        let mut input = InputState::new();
+        let mut camera_input = CameraInput::new();
+
+        // Without the button held the delta must be discarded, not banked.
+        input.mouse_motion(50.0, 0.0);
+        camera_input.update(&mut rig, &mut input, 1.0 / 60.0);
+        assert!(rig.yaw().abs() < 1e-6, "look must need the button held");
+
+        input.mouse_button_event(MouseButton::Left, ElementState::Pressed);
+        input.mouse_motion(50.0, 0.0);
+        camera_input.update(&mut rig, &mut input, 1.0 / 60.0);
+        assert!(rig.yaw().abs() > 1e-4, "held button should rotate, yaw = {}", rig.yaw());
+    }
+
+    /// A freshly built AppState must not have a UI layer holding focus, or the
+    /// camera would be dead on arrival.
+    #[test]
+    fn ui_starts_without_focus() {
+        assert!(!build_menu().is_open(), "the menu must start closed");
+        assert!(!build_console().is_open(), "the console must start closed");
     }
 
     #[test]

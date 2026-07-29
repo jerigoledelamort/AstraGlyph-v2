@@ -21,15 +21,33 @@ pub struct InputState {
     /// character (respecting layout, shift and dead keys), while movement needs
     /// the physical key position. The console consumes this; the camera does not.
     typed: String,
+    /// Echo every input event to stderr.
+    ///
+    /// Enabled with `ASTRAGLYPH_INPUT_TRACE=1`. "The controls do not respond" is
+    /// impossible to diagnose from the outside — it could be the OS not
+    /// delivering events, this layer dropping them, or a consumer ignoring them —
+    /// and those are indistinguishable without seeing what actually arrives.
+    trace: bool,
 }
 
 impl InputState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            trace: std::env::var("ASTRAGLYPH_INPUT_TRACE").is_ok_and(|v| v != "0"),
+            ..Default::default()
+        }
+    }
+
+    /// Whether input tracing is on.
+    pub fn is_tracing(&self) -> bool {
+        self.trace
     }
 
     /// Record a key state change.
     pub fn key_event(&mut self, key: KeyCode, state: ElementState) {
+        if self.trace {
+            eprintln!("input: key {key:?} {state:?}");
+        }
         match state {
             ElementState::Pressed => {
                 self.pressed_keys.insert(key);
@@ -42,6 +60,9 @@ impl InputState {
 
     /// Record a mouse button state change.
     pub fn mouse_button_event(&mut self, button: MouseButton, state: ElementState) {
+        if self.trace {
+            eprintln!("input: mouse {button:?} {state:?}");
+        }
         match state {
             ElementState::Pressed => {
                 self.pressed_mouse.insert(button);
@@ -54,6 +75,9 @@ impl InputState {
 
     /// Accumulate mouse motion.
     pub fn mouse_motion(&mut self, dx: f64, dy: f64) {
+        if self.trace {
+            eprintln!("input: motion {dx:+.1},{dy:+.1} (look_active={})", self.is_look_active());
+        }
         self.mouse_delta.0 += dx;
         self.mouse_delta.1 += dy;
     }
@@ -81,6 +105,21 @@ impl InputState {
     /// Drop any pending text without consuming it as input — used when focus
     /// moves so stale keystrokes do not appear in a newly opened field.
     pub fn clear_typed(&mut self) {
+        self.typed.clear();
+    }
+
+    /// Forget everything currently held down.
+    ///
+    /// Must be called when the window loses focus: the release event for a key
+    /// held at that moment is delivered to whatever took focus, never to us, so
+    /// the key would stay "pressed" forever. That is how a stuck Tab silently
+    /// leaves a UI layer open — and with it the camera frozen — or how a stuck W
+    /// makes the camera drift on its own.
+    pub fn clear_all(&mut self) {
+        self.pressed_keys.clear();
+        self.pressed_mouse.clear();
+        self.mouse_delta = (0.0, 0.0);
+        self.mouse_wheel = 0.0;
         self.typed.clear();
     }
 
