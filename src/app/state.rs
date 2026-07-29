@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 use crate::engine::core::Result;
-use crate::ascii::{compute_tiles, ColorMode, SubdivisionPolicy};
+use crate::ascii::{compute_tiles, ColorMode, Overlay, OverlayCell, SubdivisionPolicy};
 use crate::engine::math::{Mat4, Vec3};
 use crate::graphics::GraphicsContext;
 use crate::renderer::{
@@ -216,6 +216,10 @@ pub struct AppState {
     post: PostProcessSettings,
     /// Latch for the post-processing key.
     post_key_was_down: bool,
+    /// UI layer drawn over the scene: HUD text and a crosshair. Toggled with H.
+    overlay: Overlay,
+    hud_visible: bool,
+    hud_key_was_down: bool,
 }
 
 impl AppState {
@@ -239,10 +243,12 @@ impl AppState {
             scene_format,
         )?;
 
+        // The instance buffer holds the scene cells plus the UI overlay drawn on
+        // top of them, so it is sized for both layers at full resolution.
         let composite_pipeline = CompositePipeline::new(
             &graphics.device,
             graphics.config.format,
-            grid_cols * grid_rows,
+            grid_cols * grid_rows * 2,
         )?;
         composite_pipeline.upload_atlas(&graphics.queue);
 
@@ -287,6 +293,9 @@ impl AppState {
             // the demo preset.
             post: PostProcessSettings::none(),
             post_key_was_down: false,
+            overlay: Overlay::with_glyph_map(grid_cols, grid_rows, crate::ascii::overlay_glyph_of),
+            hud_visible: true,
+            hud_key_was_down: false,
         })
     }
 
@@ -354,6 +363,13 @@ impl AppState {
             );
         }
         self.post_key_was_down = post_key_down;
+
+        // H toggles the HUD (edge-triggered).
+        let hud_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyH);
+        if hud_key_down && !self.hud_key_was_down {
+            self.hud_visible = !self.hud_visible;
+        }
+        self.hud_key_was_down = hud_key_down;
 
         // Update scene uniforms.
         self.scene_pipeline.update_camera(&self.graphics.queue, &self.camera);
@@ -501,6 +517,15 @@ impl AppState {
                 inst.color_b = b;
             }
         }
+        // Draw the UI layer and append it as extra glyph quads. Appending rather
+        // than rewriting scene cells keeps the HUD independent of whether the
+        // grid merged any tiles this frame.
+        if self.hud_visible {
+            self.draw_hud();
+            let ui = self.ascii_processor.overlay_to_instances(&self.overlay);
+            instances.extend(ui);
+        }
+
         let instance_count = instances.len() as u32;
 
         // Update instance buffer.
@@ -535,6 +560,59 @@ impl AppState {
 
     pub fn fps(&self) -> f32 {
         self.metrics.fps()
+    }
+
+    /// Redraw the HUD into the overlay: stats in the top-left, the active
+    /// toggles below them, and a centre crosshair.
+    fn draw_hud(&mut self) {
+        const TEXT: [f32; 3] = [0.85, 0.95, 0.85];
+        const DIM: [f32; 3] = [0.45, 0.55, 0.45];
+
+        self.overlay.clear();
+
+        let fps = self.metrics.fps();
+        self.overlay
+            .draw_text(1, 1, &format!("FPS {fps:.0}"), TEXT);
+        self.overlay.draw_text(
+            1,
+            2,
+            &format!("DRAWN {} CULL {}", self.drawn_count, self.culled_count),
+            DIM,
+        );
+        self.overlay.draw_text(
+            1,
+            3,
+            &format!("MAT {} GRID {}", self.materials.len(), if self.subdivision.merges() { "DYN" } else { "UNI" }),
+            DIM,
+        );
+        self.overlay.draw_text(
+            1,
+            4,
+            &format!(
+                "COLOR {} POST {}",
+                color_mode_label(self.color_mode),
+                if self.post.any_enabled() { "ON" } else { "OFF" }
+            ),
+            DIM,
+        );
+        self.overlay
+            .draw_text(1, 5, "KEYS C M P G H", DIM);
+
+        // Crosshair at the centre of the grid.
+        let (cx, cy) = (self.grid_cols / 2, self.grid_rows / 2);
+        self.overlay
+            .set_cell(cx, cy, OverlayCell::new(crate::ascii::overlay_glyph_of('+'), TEXT));
+    }
+}
+
+/// Short label for the HUD line.
+fn color_mode_label(mode: ColorMode) -> &'static str {
+    match mode {
+        ColorMode::TrueColor => "TRUE",
+        ColorMode::Ansi256 => "256",
+        ColorMode::Ansi16 => "16",
+        ColorMode::Grayscale => "GRAY",
+        ColorMode::Monochrome => "MONO",
     }
 }
 

@@ -394,6 +394,48 @@ impl AsciiProcessor {
         instances
     }
 
+    /// Turn the opaque cells of a UI overlay into glyph instances.
+    ///
+    /// These are meant to be appended AFTER the scene instances: the composite
+    /// pass draws instances in order with alpha blending, so later quads land on
+    /// top. Emitting the overlay as extra instances (rather than rewriting scene
+    /// cells) keeps it independent of the scene's cell layout — it works
+    /// unchanged whether the grid is uniform or has merged tiles.
+    pub fn overlay_to_instances(&self, overlay: &crate::ascii::Overlay) -> Vec<InstanceData> {
+        let cols = overlay.cols();
+        let rows = overlay.rows();
+        if cols == 0 || rows == 0 {
+            return Vec::new();
+        }
+
+        // Overlay cells are laid out on the same grid as the scene cells.
+        let cell_w_ndc = 2.0 / self.width as f32;
+        let cell_h_ndc = 2.0 / self.height as f32;
+
+        let mut instances = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = overlay.cell(col, row) else {
+                    continue;
+                };
+                if !cell.opaque {
+                    continue;
+                }
+                instances.push(InstanceData {
+                    ndc_x: -1.0 + col as f32 * cell_w_ndc,
+                    ndc_y: 1.0 - row as f32 * cell_h_ndc,
+                    width: cell_w_ndc,
+                    height: cell_h_ndc,
+                    glyph_index: cell.glyph_index,
+                    color_r: cell.color[0],
+                    color_g: cell.color[1],
+                    color_b: cell.color[2],
+                });
+            }
+        }
+        instances
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }

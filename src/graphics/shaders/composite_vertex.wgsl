@@ -14,6 +14,11 @@ struct InstanceData {
 };
 
 @group(0) @binding(0) var<storage, read> instances: array<InstanceData>;
+// Bound here only to read its dimensions — the glyph count is derived from the
+// atlas width instead of being hardcoded, so adding glyphs cannot desynchronize
+// the UV maths from the texture. textureDimensions is not a sampling operation,
+// so it is legal in a vertex shader.
+@group(0) @binding(1) var glyph_atlas: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
@@ -40,8 +45,8 @@ const QUAD_UVS = array<vec2<f32>, 6>(
     vec2<f32>(1.0, 1.0),
 );
 
-// Atlas layout: 14 glyphs in a single row, each 8px wide.
-const GLYPHS_PER_ROW: f32 = 14.0;
+// Atlas layout: N glyphs in a single row, each GLYPH_SIZE px wide.
+const GLYPH_SIZE: f32 = 8.0;
 
 @vertex
 fn main(
@@ -55,9 +60,11 @@ fn main(
     let x = data.ndc_x + local.x * data.width;
     let y = data.ndc_y - local.y * data.height; // y goes down, ndc_y is top
 
-    // Map UV [0,1] to the glyph's slice in the atlas row.
-    let glyph_start = f32(data.glyph_index) / GLYPHS_PER_ROW;
-    let glyph_size = 1.0 / GLYPHS_PER_ROW;
+    // Map UV [0,1] to the glyph's slice in the atlas row. The number of glyphs
+    // comes from the atlas texture itself.
+    let glyphs_per_row = max(f32(textureDimensions(glyph_atlas).x) / GLYPH_SIZE, 1.0);
+    let glyph_start = f32(data.glyph_index) / glyphs_per_row;
+    let glyph_size = 1.0 / glyphs_per_row;
     let base_uv = QUAD_UVS[vertex_id];
     let atlas_uv = vec2<f32>(glyph_start + base_uv.x * glyph_size, base_uv.y);
 

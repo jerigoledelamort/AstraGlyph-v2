@@ -67,9 +67,11 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 
 ### 3.1 Glyph System
 - [x] Dynamic cell grid (variable cell sizes — depth-driven merging, toggle: G)
+- [x] Procedural text font: hand-coded 5x7 bitmaps for printable ASCII
 - [ ] Extended Unicode set (CJK characters, emojis for fun)
 - [x] Color modes: ANSI 256, TrueColor (16M), ANSI 16, grayscale (cycle: M)
-- [ ] TTF font loading → bitmap atlas (fallback if no procedural font)
+- [ ] TTF font loading → bitmap atlas (optional — the procedural font above is
+      the primary path, per this item's original "fallback" framing)
 
 ### 3.2 Post-Processing
 - [x] Bloom effect in ASCII space
@@ -79,7 +81,7 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 
 ### 3.3 UI Layer
 - [x] 2D ASCII overlay on top of 3D scene (buffer + compositing)
-- [ ] HUD elements (FPS counter, debug info, crosshair) — needs text glyphs (TTF)
+- [x] HUD elements (FPS counter, debug info, crosshair — toggle: H)
 - [ ] Menu system (text-based menus, buttons, navigation)
 - [ ] Console / debug command line
 

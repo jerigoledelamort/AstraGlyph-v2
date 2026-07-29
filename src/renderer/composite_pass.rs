@@ -1,7 +1,7 @@
 // Composite pass: renders ASCII glyphs to the screen surface.
 // Uses a glyph atlas texture and per-cell instance data.
 
-use crate::ascii::{build_atlas, glyph_count, GLYPH_SIZE};
+use crate::ascii::{build_combined_atlas, combined_glyph_count, GLYPH_SIZE};
 use crate::engine::core::{cast_slice, Pod, Result};
 use crate::graphics::pipeline;
 use wgpu::{Device, Queue, TextureFormat};
@@ -34,7 +34,9 @@ pub struct CompositePipeline {
 
 impl CompositePipeline {
 pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) -> Result<Self> {
-        let glyph_count_val = glyph_count() as u32;
+        // The atlas holds the shading glyphs AND the text font (see ascii/mod.rs),
+        // so text and scene cells can be drawn from one texture.
+        let glyph_count_val = combined_glyph_count() as u32;
         let atlas_width = glyph_count_val * GLYPH_SIZE;
 
         // Create empty glyph atlas texture; data uploaded later via upload_atlas().
@@ -93,7 +95,9 @@ pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) ->
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        // Also visible to the vertex stage, which reads the atlas
+                        // dimensions to derive the glyph count for UV slicing.
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
@@ -183,8 +187,8 @@ pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) ->
     /// Upload the glyph atlas data to the texture.
     /// Converts RGBA atlas data to single-channel R8.
     pub fn upload_atlas(&self, queue: &Queue) {
-        let rgba_atlas = build_atlas();
-        let glyph_count_val = glyph_count() as u32;
+        let rgba_atlas = build_combined_atlas();
+        let glyph_count_val = combined_glyph_count() as u32;
         let atlas_width = glyph_count_val * GLYPH_SIZE;
 
         // Convert RGBA (4 bytes per pixel) to R8 (1 byte per pixel) by extracting the red channel.

@@ -5,10 +5,8 @@
 @group(0) @binding(1) var glyph_atlas: texture_2d<f32>;
 @group(0) @binding(2) var glyph_sampler: sampler;
 
-// Grid layout: rows of glyphs packed horizontally in the atlas.
-// For 14 glyphs in an 8x8 grid, we use a 1-row atlas (14 columns x 1 row of 8px cells).
-const GLYPHS_PER_ROW: f32 = 14.0;
-const GLYPH_SIZE: f32 = 8.0;
+// The atlas is a single row of 8px glyph cells; the vertex stage already mapped
+// each instance's UV into its own slice, so nothing here needs the glyph count.
 
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
