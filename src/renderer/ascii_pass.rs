@@ -496,9 +496,11 @@ impl AsciiProcessor {
             return Vec::new();
         }
 
-        // Overlay cells are laid out on the same grid as the scene cells.
-        let cell_w_ndc = 2.0 / self.width as f32;
-        let cell_h_ndc = 2.0 / self.height as f32;
+        // Overlay cells sit on the GLYPH grid, which is half the processor's
+        // subpixel resolution — using the subpixel size here would draw the HUD at
+        // half scale.
+        let cell_w_ndc = 2.0 / (self.width / 2).max(1) as f32;
+        let cell_h_ndc = 2.0 / (self.height / 2).max(1) as f32;
 
         let mut instances = Vec::new();
         for row in 0..rows {

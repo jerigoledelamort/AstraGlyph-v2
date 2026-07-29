@@ -196,11 +196,11 @@ pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) ->
         let glyph_count_val = combined_glyph_count() as u32;
         let atlas_width = glyph_count_val * GLYPH_SIZE;
 
-        // Convert RGBA (4 bytes per pixel) to R8 (1 byte per pixel) by extracting the red channel.
-        let r8_data: Vec<u8> = rgba_atlas
-            .chunks(4)
-            .map(|pixel| pixel[0]) // R channel (255 for visible, 0 for invisible)
-            .collect();
+        // The atlas is built glyph-by-glyph, but the texture is addressed
+        // row-by-row across the whole strip. Transposing is mandatory: uploading
+        // the glyph-major bytes as if they were rows scrambles every glyph into
+        // fragments of its neighbours.
+        let r8_data = crate::ascii::atlas_to_row_major_r8(&rgba_atlas, combined_glyph_count());
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {

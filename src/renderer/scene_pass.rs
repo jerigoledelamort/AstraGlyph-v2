@@ -196,6 +196,7 @@ struct MeshBuffers {
 pub struct ScenePipeline {
     opaque_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
+    glass_tint_pipeline: wgpu::RenderPipeline,
     vp_buffer: wgpu::Buffer,
     lights_meta_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -440,9 +441,11 @@ impl ScenePipeline {
         let depth_texture = texture::depth_texture(device, "scene_depth", width, height);
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Shared descriptor builder for the opaque and transparent pipeline variants:
-        // same shaders/layout/vertex format, different blend + depth-write state.
-        let make_pipeline = |label: &str, blend: wgpu::BlendState, depth_write: bool| {
+        // Shared descriptor builder for the pipeline variants: same shaders,
+        // layout and vertex format, differing only in blend state, depth-write and
+        // fragment entry point.
+        let make_pipeline_entry =
+            |label: &str, blend: wgpu::BlendState, depth_write: bool, entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -454,7 +457,7 @@ impl ScenePipeline {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &fs_module,
-                    entry_point: Some("main"),
+                    entry_point: Some(entry),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
@@ -485,11 +488,41 @@ impl ScenePipeline {
         };
 
         // Opaque: writes depth, no blending (straight overwrite).
-        let opaque_pipeline = make_pipeline("scene_pipeline_opaque", wgpu::BlendState::REPLACE, true);
+        let opaque_pipeline = make_pipeline_entry(
+            "scene_pipeline_opaque",
+            wgpu::BlendState::REPLACE,
+            true,
+            "main",
+        );
         // Transparent: tested against opaque depth but doesn't write depth itself —
         // relies on back-to-front draw order (see render_batched) instead.
-        let transparent_pipeline =
-            make_pipeline("scene_pipeline_transparent", wgpu::BlendState::ALPHA_BLENDING, false);
+        let transparent_pipeline = make_pipeline_entry(
+            "scene_pipeline_transparent",
+            wgpu::BlendState::ALPHA_BLENDING,
+            false,
+            "main",
+        );
+        // Glass tint: multiply blend (result = destination * source), drawn before
+        // the transparent surface pass. Alpha blending alone can only fade the
+        // background toward the glass colour; multiplying is what actually filters
+        // it, so objects seen through coloured glass take on its hue.
+        let glass_tint_pipeline = make_pipeline_entry(
+            "scene_pipeline_glass_tint",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::Zero,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+            "tint",
+        );
 
         // Shadow pass: depth-only, rendered from light[0]'s point of view.
         let shadow_bind_group_layout =
@@ -579,6 +612,7 @@ impl ScenePipeline {
         Ok(Self {
             opaque_pipeline,
             transparent_pipeline,
+            glass_tint_pipeline,
             vp_buffer,
             lights_meta_buffer,
             lights_buffer,
@@ -861,11 +895,20 @@ impl ScenePipeline {
                 }
             }
 
-            rpass.set_pipeline(&self.transparent_pipeline);
+            // Transparent objects, farthest first. Each one is drawn twice: the
+            // tint pass filters whatever is already behind it, then the surface
+            // pass adds its own shading, reflections and rim. Interleaving the two
+            // per object (rather than doing all tints then all surfaces) keeps the
+            // back-to-front ordering correct when glass overlaps glass.
             for (entity, object_index, _) in &transparent {
                 if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
                     rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
                     rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+                    rpass.set_pipeline(&self.glass_tint_pipeline);
+                    rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+
+                    rpass.set_pipeline(&self.transparent_pipeline);
                     rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
                 }
             }

@@ -51,6 +51,41 @@ pub fn block_glyph_index(pattern: u8) -> u32 {
     BLOCK_GLYPH_OFFSET + (pattern & 0b1111) as u32
 }
 
+/// Convert the per-glyph atlas layout into the row-major single-channel data a
+/// GPU texture upload expects.
+///
+/// `build_*_atlas()` emits glyphs one after another: all 64 pixels of glyph 0,
+/// then all 64 of glyph 1, and so on. A texture of `count * GLYPH_SIZE` by
+/// `GLYPH_SIZE` pixels is instead addressed row by row: row `y` holds row `y` of
+/// EVERY glyph, side by side.
+///
+/// Uploading the per-glyph layout directly therefore scrambles the atlas — every
+/// sampled cell picks up fragments of unrelated glyphs, which is what made the
+/// output look like arbitrary noise and the HUD unreadable. This function does
+/// the transpose and takes the red channel (coverage is stored in every channel;
+/// the texture is R8Unorm).
+pub fn atlas_to_row_major_r8(atlas_rgba: &[u8], glyph_count: usize) -> Vec<u8> {
+    let size = GLYPH_SIZE as usize;
+    let width = glyph_count * size;
+    let mut out = vec![0u8; width * size];
+
+    for glyph in 0..glyph_count {
+        for y in 0..size {
+            for x in 0..size {
+                // Source: glyph-major, 4 bytes per pixel.
+                let src = ((glyph * size * size) + y * size + x) * 4;
+                // Destination: row-major across the whole atlas strip.
+                let dst = y * width + glyph * size + x;
+                if let (Some(&v), Some(slot)) = (atlas_rgba.get(src), out.get_mut(dst)) {
+                    *slot = v;
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Atlas index for a text character, or `None` when the font does not cover it.
 pub fn text_glyph_index(c: char) -> Option<u32> {
     font5x7::glyph_index(c).map(|i| FONT_GLYPH_OFFSET + i as u32)
@@ -127,6 +162,75 @@ mod tests {
         assert_eq!(overlay_glyph_of('\n'), glyph_atlas::SPACE_INDEX);
     }
 
+    /// The bug this guards against shipped from the very first commit: the atlas
+    /// was uploaded glyph-major into a row-major texture, so every sampled cell
+    /// showed slices of unrelated glyphs. Nothing caught it because the atlas
+    /// *content* was correct — only its arrangement for the GPU was wrong.
+    #[test]
+    fn row_major_conversion_places_each_glyph_row_side_by_side() {
+        let atlas = build_combined_atlas();
+        let count = combined_glyph_count();
+        let rows = atlas_to_row_major_r8(&atlas, count);
+        let size = GLYPH_SIZE as usize;
+        let width = count * size;
+
+        assert_eq!(rows.len(), width * size, "one byte per texel");
+
+        // Check a glyph whose shape is unambiguous: the solid block must be fully
+        // set on every row, at its own horizontal slot.
+        let solid = block_glyph_index(0b1111) as usize;
+        for y in 0..size {
+            for x in 0..size {
+                assert_eq!(
+                    rows[y * width + solid * size + x],
+                    255,
+                    "solid block hole at ({x},{y})"
+                );
+            }
+        }
+
+        // The upper-half block must be set on the top four rows and clear below —
+        // this is what distinguishes a correct transpose from a plausible-looking
+        // but wrong one.
+        let upper = block_glyph_index(blocks::UL | blocks::UR) as usize;
+        for y in 0..size {
+            let expected = if y < size / 2 { 255 } else { 0 };
+            for x in 0..size {
+                assert_eq!(
+                    rows[y * width + upper * size + x],
+                    expected,
+                    "upper-half block wrong at ({x},{y})"
+                );
+            }
+        }
+
+        // The space glyph stays empty, and a text glyph keeps its own bitmap.
+        let space = glyph_atlas::SPACE_INDEX as usize;
+        for y in 0..size {
+            for x in 0..size {
+                assert_eq!(rows[y * width + space * size + x], 0);
+            }
+        }
+        let a = text_glyph_index('A').unwrap() as usize;
+        let expected_a = font5x7::render_glyph('A').unwrap();
+        for y in 0..size {
+            for x in 0..size {
+                assert_eq!(
+                    rows[y * width + a * size + x],
+                    expected_a[y * size + x][0],
+                    "glyph 'A' differs at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_major_conversion_tolerates_a_short_input() {
+        // Must not panic if the caller passes a mismatched count.
+        let out = atlas_to_row_major_r8(&[255, 255, 255, 255], 4);
+        assert_eq!(out.len(), 4 * 8 * 8);
+    }
+
     #[test]
     fn the_font_section_bytes_match_the_font_atlas() {
         let atlas = build_combined_atlas();
@@ -135,3 +239,4 @@ mod tests {
         assert_eq!(&atlas[offset..offset + font.len()], &font[..]);
     }
 }
+

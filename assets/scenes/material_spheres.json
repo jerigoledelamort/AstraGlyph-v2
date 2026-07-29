@@ -48,8 +48,9 @@
     },
     {
       "name": "red_sphere_matte",
+      "comment": "pushed back so the glass sphere in front can be seen filtering it",
       "transform": {
-        "position": [-2.5, -0.5, 0.0],
+        "position": [-2.2, -0.5, -2.0],
         "scale": [1.5, 1.5, 1.5]
       },
       "mesh": {
@@ -69,7 +70,7 @@
     {
       "name": "blue_sphere_mirror",
       "transform": {
-        "position": [2.5, -0.5, 0.0],
+        "position": [2.2, -0.5, -2.0],
         "scale": [1.5, 1.5, 1.5]
       },
       "mesh": {
@@ -110,9 +111,10 @@
     },
     {
       "name": "green_sphere_glass",
+      "comment": "in FRONT of the matte and mirror spheres, and wide enough to overlap both, so the tint pass is visible: what is behind it should turn green",
       "transform": {
-        "position": [0.0, -0.5, -2.5],
-        "scale": [1.5, 1.5, 1.5]
+        "position": [0.0, -0.3, 2.2],
+        "scale": [1.8, 1.8, 1.8]
       },
       "mesh": {
         "type": "sphere",
