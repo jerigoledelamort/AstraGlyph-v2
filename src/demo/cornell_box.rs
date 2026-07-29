@@ -7,6 +7,7 @@
 // - Two boxes inside
 
 use crate::engine::math::{Vec3, Vec4};
+use crate::renderer::LightUniform;
 use crate::scene::{
     Camera, Entity, MaterialComponent, MeshComponent, MeshVertex, Projection, Scene,
 };
@@ -211,4 +212,14 @@ fn add_mesh_entity(scene: &mut Scene, mesh: MeshComponent, material: MaterialCom
 /// Default light direction for the Cornell box (pointing down and slightly forward).
 pub fn default_light() -> Vec3 {
     Vec3::new(0.0, -1.0, -0.3).normalize()
+}
+
+/// Lights for the Cornell box: a ceiling point light (the classic Cornell
+/// box light panel) plus a very weak directional fill so the shadowed
+/// (unlit) walls aren't pure black.
+pub fn lights() -> Vec<LightUniform> {
+    vec![
+        LightUniform::point(Vec3::new(0.0, 250.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 0.1, 1.0),
+        LightUniform::directional(default_light(), Vec3::new(1.0, 1.0, 1.0), 0.02, 0.15),
+    ]
 }

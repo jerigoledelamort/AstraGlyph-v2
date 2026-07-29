@@ -1,20 +1,40 @@
 // ASCII pass: reads back the scene render target and converts pixels to
 // glyph instance data for the composite pass.
+//
+// Readback is double-buffered: each frame we kick off an async map on one
+// buffer and non-blockingly poll the other buffer submitted the previous
+// frame. The CPU never blocks waiting for the GPU — at the cost of the
+// composited image trailing the scene by up to ~1 frame, which is
+// imperceptible at interactive framerates.
 
 use std::sync::mpsc;
-use crate::engine::core::Result;
 use crate::renderer::composite_pass::InstanceData;
 use wgpu::{Buffer, Device, Extent3d, Queue};
 
+/// One of the two ping-ponged readback buffers.
+struct ReadbackSlot {
+    buffer: Buffer,
+    /// Set once `map_async` has been issued; cleared once the result has
+    /// been consumed (successfully or not). While set, this buffer must not
+    /// be copied into or re-mapped.
+    pending: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
 /// Handles GPU texture readback and ASCII conversion.
 pub struct AsciiProcessor {
-    /// Staging buffer for texture readback (CPU-visible).
-    readback_buffer: Buffer,
+    slots: [ReadbackSlot; 2],
+    /// Index into `slots` that will receive the next copy + map_async.
+    write_index: usize,
     /// Buffer size in bytes (padded to 256-byte rows).
+    #[allow(dead_code)]
     buffer_size: u64,
     width: u32,
     height: u32,
     bytes_per_row: u32,
+    /// Most recently fully-read frame. Reused whenever neither slot has a
+    /// freshly completed map yet, so callers always get a full frame instead
+    /// of a partial/stale one.
+    last_pixels: Vec<[u8; 4]>,
 }
 
 impl AsciiProcessor {
@@ -23,31 +43,69 @@ impl AsciiProcessor {
         let bytes_per_row = (width * 4 + 255) & !255; // round up to 256
         let buffer_size = (bytes_per_row * height) as u64;
 
-        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ascii_readback_buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let make_buffer = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
 
         Self {
-            readback_buffer,
+            slots: [
+                ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_0"), pending: None },
+                ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_1"), pending: None },
+            ],
+            write_index: 0,
             buffer_size,
             width,
             height,
             bytes_per_row,
+            last_pixels: vec![[0, 0, 0, 255]; (width * height) as usize],
         }
     }
 
-    /// Copy the scene render target into the readback buffer and read pixels.
+    /// Advance the double-buffered readback by one frame:
+    /// - Non-blockingly check the slot submitted on a previous frame; if its
+    ///   `map_async` has completed, extract its pixels into `last_pixels`.
+    /// - Kick off a fresh copy + `map_async` on the other slot (unless it is
+    ///   still waiting on a previous map — a rare backpressure case).
     ///
-    /// This blocks until the GPU finishes the copy and the buffer is mapped.
+    /// Returns the most recently completed full frame. This never blocks on
+    /// the GPU; the result may lag the current frame by roughly one frame.
     pub fn read_pixels(
-        &self,
+        &mut self,
         device: &Device,
         queue: &Queue,
         source: &wgpu::Texture,
-    ) -> Result<Vec<[u8; 4]>> {
+    ) -> Vec<[u8; 4]> {
+        // Give any in-flight map_async callbacks a chance to fire, without blocking.
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        let read_index = 1 - self.write_index;
+        if let Some(rx) = &self.slots[read_index].pending {
+            if let Ok(result) = rx.try_recv() {
+                self.slots[read_index].pending = None;
+                if result.is_ok() {
+                    self.extract_pixels(read_index);
+                }
+                self.slots[read_index].buffer.unmap();
+            }
+            // else: still pending — keep serving `last_pixels` from before.
+        }
+
+        // Only submit new work into a slot that isn't already awaiting a map.
+        if self.slots[self.write_index].pending.is_none() {
+            self.submit_copy(device, queue, source, self.write_index);
+            self.write_index = read_index;
+        }
+
+        self.last_pixels.clone()
+    }
+
+    /// Copy the scene texture into `slot_index`'s buffer and start an async map.
+    fn submit_copy(&mut self, device: &Device, queue: &Queue, source: &wgpu::Texture, slot_index: usize) {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ascii_readback_encoder"),
         });
@@ -60,7 +118,7 @@ impl AsciiProcessor {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback_buffer,
+                buffer: &self.slots[slot_index].buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.bytes_per_row),
@@ -76,33 +134,20 @@ impl AsciiProcessor {
 
         queue.submit(std::iter::once(encoder.finish()));
 
-        // Map the buffer and wait for completion.
         let (tx, rx) = mpsc::channel();
-        self.readback_buffer
+        self.slots[slot_index]
+            .buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
+        self.slots[slot_index].pending = Some(rx);
+    }
 
-        // Poll the device until the mapping is done.
-        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).map_err(|e| {
-            crate::engine::core::EngineError::Graphics(format!("poll error: {e}"))
-        })?;
-
-        rx.recv()
-            .map_err(|e| {
-                crate::engine::core::EngineError::Graphics(format!(
-                    "channel error: {e}"
-                ))
-            })?
-            .map_err(|e| {
-                crate::engine::core::EngineError::Graphics(format!(
-                    "map error: {e}"
-                ))
-            })?;
-
-        // Read the mapped data, skipping padding bytes.
-        let mapped = self.readback_buffer.slice(..).get_mapped_range()
+    /// Read the mapped bytes out of `slot_index`'s buffer into `last_pixels`,
+    /// skipping row-padding bytes. Assumes the buffer is currently mapped.
+    fn extract_pixels(&mut self, slot_index: usize) {
+        let mapped = self.slots[slot_index].buffer.slice(..).get_mapped_range()
             .expect("failed to map readback buffer for reading");
         let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
 
@@ -120,9 +165,7 @@ impl AsciiProcessor {
         }
 
         drop(mapped);
-        self.readback_buffer.unmap();
-
-        Ok(pixels)
+        self.last_pixels = pixels;
     }
 
     /// Convert raw pixels to glyph instance data for the composite pass.

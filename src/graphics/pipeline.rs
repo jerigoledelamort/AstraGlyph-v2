@@ -18,7 +18,7 @@ pub fn compile_shader(device: &Device, label: &str, source: &str) -> wgpu::Shade
 }
 
 /// Build a simple vertex attribute descriptor from a format and offset.
-pub fn vertex_attr(location: u32, format: wgpu::VertexFormat, offset: u64) -> wgpu::VertexAttribute {
+pub const fn vertex_attr(location: u32, format: wgpu::VertexFormat, offset: u64) -> wgpu::VertexAttribute {
     wgpu::VertexAttribute {
         shader_location: location,
         format,

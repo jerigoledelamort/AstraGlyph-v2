@@ -54,20 +54,107 @@ pub struct MeshVertex {
 
 unsafe impl crate::engine::core::Pod for MeshVertex {}
 
+/// Material type determining the shading model.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterialType {
+    /// Matte / diffuse surface (Lambertian).
+    Matte = 0,
+    /// Mirror / reflective surface.
+    Mirror = 1,
+    /// Glass / transparent refractive surface.
+    Glass = 2,
+}
+
+impl Default for MaterialType {
+    fn default() -> Self {
+        Self::Matte
+    }
+}
+
 /// Material describing surface properties.
+/// Mirrors the WGSL `Material` struct layout (48 bytes, std430-compatible).
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MaterialComponent {
-    /// Diffuse (albedo) color.
+    /// Diffuse (albedo) color. The .w component is padding for alignment.
     pub color: Vec4,
+    /// Material type: 0=Matte, 1=Mirror, 2=Glass.
+    pub material_type: u32,
     /// Ambient coefficient.
     pub ambient: f32,
     /// Diffuse coefficient.
     pub diffuse: f32,
+    /// Specular coefficient.
+    pub specular: f32,
+    /// Shininess exponent (Phong specular power).
+    pub shininess: f32,
+    /// Index of refraction (for glass, e.g. 1.5 for typical glass).
+    pub ior: f32,
+    /// Reflectivity at normal incidence (0..1).
+    pub reflectivity: f32,
+    /// Transparency (0=opaque, 1=fully transparent).
+    pub transparency: f32,
 }
 
 impl MaterialComponent {
     pub const fn new(color: Vec4, ambient: f32, diffuse: f32) -> Self {
-        Self { color, ambient, diffuse }
+        Self {
+            color,
+            material_type: MaterialType::Matte as u32,
+            ambient,
+            diffuse,
+            specular: 0.0,
+            shininess: 1.0,
+            ior: 1.0,
+            reflectivity: 0.0,
+            transparency: 0.0,
+        }
+    }
+
+    /// Create a matte material with the given albedo and diffuse coefficient.
+    pub const fn matte(color: Vec4, ambient: f32, diffuse: f32) -> Self {
+        Self {
+            color,
+            material_type: MaterialType::Matte as u32,
+            ambient,
+            diffuse,
+            specular: 0.0,
+            shininess: 1.0,
+            ior: 1.0,
+            reflectivity: 0.0,
+            transparency: 0.0,
+        }
+    }
+
+    /// Create a mirror material with high specular and reflectivity.
+    pub const fn mirror(color: Vec4, reflectivity: f32) -> Self {
+        Self {
+            color,
+            material_type: MaterialType::Mirror as u32,
+            ambient: 0.05,
+            diffuse: 0.1,
+            specular: 0.8,
+            shininess: 128.0,
+            ior: 1.0,
+            reflectivity,
+            transparency: 0.0,
+        }
+    }
+
+    /// Create a glass material with refraction and transparency.
+    pub const fn glass(color: Vec4, ior: f32, transparency: f32) -> Self {
+        Self {
+            color,
+            material_type: MaterialType::Glass as u32,
+            ambient: 0.05,
+            diffuse: 0.1,
+            specular: 0.5,
+            shininess: 64.0,
+            ior,
+            reflectivity: 0.1,
+            transparency,
+        }
     }
 }
 
@@ -75,10 +162,49 @@ impl Component for MaterialComponent {}
 
 impl Default for MaterialComponent {
     fn default() -> Self {
+        Self::matte(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.1, 0.9)
+    }
+}
+
+/// GPU-ready material uniform, matching the WGSL `Material` struct.
+/// 48 bytes, std430-compatible.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MaterialUniform {
+    /// Albedo color (xyz) + padding (w).
+    pub albedo: [f32; 4],
+    /// Material type: 0=Matte, 1=Mirror, 2=Glass.
+    pub material_type: u32,
+    /// Ambient coefficient.
+    pub ambient: f32,
+    /// Diffuse coefficient.
+    pub diffuse: f32,
+    /// Specular coefficient.
+    pub specular: f32,
+    /// Shininess exponent.
+    pub shininess: f32,
+    /// Index of refraction.
+    pub ior: f32,
+    /// Reflectivity at normal incidence.
+    pub reflectivity: f32,
+    /// Transparency.
+    pub transparency: f32,
+}
+
+unsafe impl crate::engine::core::Pod for MaterialUniform {}
+
+impl From<&MaterialComponent> for MaterialUniform {
+    fn from(m: &MaterialComponent) -> Self {
         Self {
-            color: Vec4::new(1.0, 1.0, 1.0, 1.0),
-            ambient: 0.1,
-            diffuse: 0.9,
+            albedo: [m.color.x, m.color.y, m.color.z, m.color.w],
+            material_type: m.material_type,
+            ambient: m.ambient,
+            diffuse: m.diffuse,
+            specular: m.specular,
+            shininess: m.shininess,
+            ior: m.ior,
+            reflectivity: m.reflectivity,
+            transparency: m.transparency,
         }
     }
 }
