@@ -7,8 +7,8 @@ use crate::ascii::{compute_tiles, ColorMode, Overlay, OverlayCell, SubdivisionPo
 use crate::engine::math::{degrees, radians, Mat4, Vec3};
 use crate::graphics::{FrameOutcome, GraphicsContext};
 use crate::renderer::{
-    post_process, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer, LightUniform,
-    ObjectUniform, PostProcessSettings, ScenePipeline,
+    post_process, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer, GlyphStyle,
+    LightUniform, ObjectUniform, PostProcessSettings, ScenePipeline,
 };
 use crate::scene::{
     Aabb, Camera, CameraMode, CameraRig, Entity, Frustum, Hierarchy, MaterialComponent,
@@ -160,6 +160,10 @@ fn seed_rig_from_camera(camera: &Camera) -> CameraRig {
     rig
 }
 
+/// Scene supersampling factor: the render target is this many times the glyph
+/// grid on each axis, giving every cell a 2x2 block of subpixels.
+const SUBSAMPLE: u32 = 2;
+
 /// Scene file the demo starts with, resolved relative to the working directory
 /// first (so an edited file is picked up by `cargo run`) and then relative to
 /// the crate root (so it also works when launched from elsewhere).
@@ -241,6 +245,10 @@ pub struct AppState {
     overlay: Overlay,
     hud_visible: bool,
     hud_key_was_down: bool,
+    /// How cells become glyphs: quadrant blocks or the brightness ramp.
+    /// Toggled with B.
+    glyph_style: GlyphStyle,
+    style_key_was_down: bool,
 }
 
 impl AppState {
@@ -252,15 +260,22 @@ impl AppState {
     ) -> Result<Self> {
         let graphics = GraphicsContext::new(window, width, height)?;
 
-        // ASCII grid resolution (low-res scene render target).
+        // Glyph grid resolution.
         let grid_cols = 120;
         let grid_rows = 68;
+
+        // The scene renders at TWICE the glyph grid, so each cell owns a 2x2
+        // block of subpixels. Quadrant block glyphs turn that into genuinely
+        // double the visible resolution, and the ramp style gets free
+        // anti-aliasing from averaging the same block.
+        let sub_cols = grid_cols * SUBSAMPLE;
+        let sub_rows = grid_rows * SUBSAMPLE;
 
         let scene_format = wgpu::TextureFormat::Rgba8Unorm;
         let scene_pipeline = ScenePipeline::new(
             &graphics.device,
-            grid_cols,
-            grid_rows,
+            sub_cols,
+            sub_rows,
             scene_format,
         )?;
 
@@ -275,8 +290,8 @@ impl AppState {
 
         let ascii_processor = AsciiProcessor::new(
             &graphics.device,
-            grid_cols,
-            grid_rows,
+            sub_cols,
+            sub_rows,
         );
 
         let (scene, camera, lights, hierarchy) = load_startup_scene();
@@ -317,6 +332,8 @@ impl AppState {
             overlay: Overlay::with_glyph_map(grid_cols, grid_rows, crate::ascii::overlay_glyph_of),
             hud_visible: true,
             hud_key_was_down: false,
+            glyph_style: GlyphStyle::default(),
+            style_key_was_down: false,
         })
     }
 
@@ -421,6 +438,17 @@ impl AppState {
             self.hud_visible = !self.hud_visible;
         }
         self.hud_key_was_down = hud_key_down;
+
+        // B switches between block elements and the brightness ramp.
+        let style_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyB);
+        if style_key_down && !self.style_key_was_down {
+            self.glyph_style = match self.glyph_style {
+                GlyphStyle::Blocks => GlyphStyle::Ramp,
+                GlyphStyle::Ramp => GlyphStyle::Blocks,
+            };
+            eprintln!("glyphs: style = {:?}", self.glyph_style);
+        }
+        self.style_key_was_down = style_key_down;
 
         // Update scene uniforms.
         self.scene_pipeline.update_camera(&self.graphics.queue, &self.camera);
@@ -529,29 +557,37 @@ impl AppState {
             None
         };
 
-        // Post-processing runs on the pixel buffer, before glyphs are chosen, so
-        // bloom and AO influence which character each cell gets — not just its
+        // Post-processing runs on the subpixel buffer, before glyphs are chosen,
+        // so bloom and AO influence which character each cell gets — not just its
         // colour. That is the whole point of doing it "in ASCII space".
+        let sub_cols = self.grid_cols * SUBSAMPLE;
+        let sub_rows = self.grid_rows * SUBSAMPLE;
         if self.post.any_enabled() {
-            if let Ok(mut fb) = FrameBuffer::from_rgba8(&pixels, self.grid_cols, self.grid_rows) {
-                let depth_buf = depth.as_ref().and_then(|d| {
-                    DepthBuffer::from_slice(d, self.grid_cols, self.grid_rows).ok()
-                });
+            if let Ok(mut fb) = FrameBuffer::from_rgba8(&pixels, sub_cols, sub_rows) {
+                let depth_buf = depth
+                    .as_ref()
+                    .and_then(|d| DepthBuffer::from_slice(d, sub_cols, sub_rows).ok());
                 post_process::apply_all(&mut fb, depth_buf.as_ref(), &self.post);
                 pixels = fb.to_rgba8();
             }
         }
 
-        // Convert pixels to glyph instance data. With a merging policy active,
-        // depth decides which cells collapse into larger glyphs.
-        let (sw, sh) = self.graphics.size();
+        // Convert subpixels to glyph instances. The dynamic grid merges whole
+        // cells, so it works on the cell-resolution depth obtained by taking one
+        // subpixel per cell.
         let mut instances = match (self.subdivision.merges(), depth.as_ref()) {
             (true, Some(depth)) => {
+                // Merging decisions are per CELL, so the subpixel depth is reduced
+                // to one value per cell first.
+                let cell_depth = downsample_depth(depth, sub_cols, sub_rows);
                 let tiles =
-                    compute_tiles(depth, self.grid_cols, self.grid_rows, &self.subdivision);
-                self.ascii_processor.pixels_to_instances_tiled(&pixels, &tiles)
+                    compute_tiles(&cell_depth, self.grid_cols, self.grid_rows, &self.subdivision);
+                self.ascii_processor
+                    .subpixels_to_instances_tiled(&pixels, &tiles, self.glyph_style)
             }
-            _ => self.ascii_processor.pixels_to_instances(&pixels, sw, sh),
+            _ => self
+                .ascii_processor
+                .subpixels_to_instances(&pixels, self.glyph_style),
         };
 
         // Quantize to the selected colour fidelity. Done on the instances rather
@@ -652,14 +688,54 @@ impl AppState {
             ),
             DIM,
         );
+        self.overlay.draw_text(
+            1,
+            5,
+            &format!("STYLE {}", if self.glyph_style == GlyphStyle::Blocks { "BLOCK" } else { "RAMP" }),
+            DIM,
+        );
         self.overlay
-            .draw_text(1, 5, "KEYS C M P G H", DIM);
+            .draw_text(1, 6, "KEYS C M P G H B", DIM);
 
         // Crosshair at the centre of the grid.
         let (cx, cy) = (self.grid_cols / 2, self.grid_rows / 2);
         self.overlay
             .set_cell(cx, cy, OverlayCell::new(crate::ascii::overlay_glyph_of('+'), TEXT));
     }
+}
+
+/// Reduce a subpixel depth buffer to one value per glyph cell.
+///
+/// Takes the MINIMUM of each cell's 2x2 block, i.e. the nearest surface in that
+/// cell. Merging decisions must be conservative: if any part of a cell holds
+/// near geometry, the cell keeps full detail.
+fn downsample_depth(depth: &[f32], sub_cols: u32, sub_rows: u32) -> Vec<f32> {
+    let cols = sub_cols / 2;
+    let rows = sub_rows / 2;
+    let mut out = Vec::with_capacity((cols * rows) as usize);
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut nearest = f32::INFINITY;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let x = col * 2 + dx;
+                    let y = row * 2 + dy;
+                    if x >= sub_cols || y >= sub_rows {
+                        continue;
+                    }
+                    let idx = (y as usize) * (sub_cols as usize) + (x as usize);
+                    if let Some(&d) = depth.get(idx) {
+                        if d.is_finite() && d < nearest {
+                            nearest = d;
+                        }
+                    }
+                }
+            }
+            // Nothing usable in this cell — treat it as empty space (far plane).
+            out.push(if nearest.is_finite() { nearest } else { 1.0 });
+        }
+    }
+    out
 }
 
 /// Short label for the HUD line.

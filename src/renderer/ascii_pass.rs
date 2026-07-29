@@ -11,6 +11,18 @@ use std::sync::mpsc;
 use crate::renderer::composite_pass::InstanceData;
 use wgpu::{Buffer, Device, Extent3d, Queue};
 
+/// How a cell's colour is turned into a glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GlyphStyle {
+    /// Unicode quadrant block elements driven by 2x2 subpixels — twice the
+    /// effective resolution, reads as tone and silhouette.
+    #[default]
+    Blocks,
+    /// The classic brightness ramp (' ' . : - = + * # % @ and shade blocks),
+    /// one glyph per averaged cell.
+    Ramp,
+}
+
 /// One of the two ping-ponged readback buffers.
 struct ReadbackSlot {
     buffer: Buffer,
@@ -310,79 +322,103 @@ impl AsciiProcessor {
         self.last_pixels = pixels;
     }
 
-    /// Convert raw pixels to glyph instance data for the composite pass.
+    /// Convert a 2x-supersampled pixel buffer into one glyph instance per cell.
     ///
-    /// Each pixel becomes one glyph quad positioned on the screen.
-    pub fn pixels_to_instances(
+    /// The processor's own `width`/`height` are the SUBPIXEL dimensions, so the
+    /// cell grid is half that in each axis. Two styles are supported:
+    ///
+    /// - `Blocks`: each cell's 2x2 subpixel block picks one of 16 quadrant block
+    ///   glyphs, doubling the effective resolution (see `ascii::blocks`).
+    /// - `Ramp`: the 2x2 block is averaged down to one colour and mapped onto the
+    ///   brightness ramp — the classic look, but now anti-aliased by the
+    ///   supersampling rather than point-sampled.
+    pub fn subpixels_to_instances(
         &self,
         pixels: &[[u8; 4]],
-        _screen_w: u32,
-        _screen_h: u32,
+        style: GlyphStyle,
     ) -> Vec<InstanceData> {
-        let cols = self.width;
-        let rows = self.height;
+        let cols = self.width / 2;
+        let rows = self.height / 2;
+        if cols == 0 || rows == 0 {
+            return Vec::new();
+        }
 
-        // Compute the glyph quad size in NDC to fill the screen while
-        // maintaining the cell grid aspect ratio.
         let cell_w_ndc = 2.0 / cols as f32;
         let cell_h_ndc = 2.0 / rows as f32;
+        let mut instances = Vec::with_capacity((cols * rows) as usize);
 
-        let mut instances = Vec::with_capacity(pixels.len());
+        for row in 0..rows {
+            for col in 0..cols {
+                let sub = crate::ascii::blocks::gather_subpixels(
+                    pixels, self.width, self.height, col, row,
+                );
 
-        for (i, pixel) in pixels.iter().enumerate() {
-            let col = (i as u32) % cols;
-            let row = (i as u32) / cols;
+                let (glyph_index, color) = match style {
+                    GlyphStyle::Blocks => {
+                        let cell = crate::ascii::blocks::classify(&sub);
+                        (crate::ascii::block_glyph_index(cell.pattern), cell.color)
+                    }
+                    GlyphStyle::Ramp => {
+                        let avg = crate::ascii::blocks::average_subpixels(&sub);
+                        let lum = crate::ascii::luminance(avg);
+                        (crate::ascii::glyph_atlas::brightness_to_index(lum), avg)
+                    }
+                };
 
-            let r = pixel[0] as f32 / 255.0;
-            let g = pixel[1] as f32 / 255.0;
-            let b = pixel[2] as f32 / 255.0;
-            let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-
-            let glyph_index = crate::ascii::glyph_atlas::brightness_to_index(luminance);
-
-            // NDC position: x goes left to right, y goes top to bottom.
-            // Top-left of screen is (-1, 1), bottom-right is (1, -1).
-            let ndc_x = -1.0 + col as f32 * cell_w_ndc;
-            let ndc_y = 1.0 - row as f32 * cell_h_ndc;
-
-            instances.push(InstanceData {
-                ndc_x,
-                ndc_y,
-                width: cell_w_ndc,
-                height: cell_h_ndc,
-                glyph_index,
-                color_r: r,
-                color_g: g,
-                color_b: b,
-            });
+                instances.push(InstanceData {
+                    ndc_x: -1.0 + col as f32 * cell_w_ndc,
+                    ndc_y: 1.0 - row as f32 * cell_h_ndc,
+                    width: cell_w_ndc,
+                    height: cell_h_ndc,
+                    glyph_index,
+                    color_r: color[0],
+                    color_g: color[1],
+                    color_b: color[2],
+                });
+            }
         }
 
         instances
     }
 
-    /// Convert pixels to glyph instances using a non-uniform tile layout
-    /// (see `ascii::grid_layout`): merged tiles become one larger glyph whose
-    /// colour is the average of the block it covers.
+    /// Same as `subpixels_to_instances`, but following a non-uniform tile layout
+    /// (see `ascii::grid_layout`): merged tiles become one larger glyph.
     ///
-    /// The uniform path (`pixels_to_instances`) is kept separate rather than
-    /// expressed as all-span-1 tiles, so the common case doesn't pay for
-    /// building and walking a tile list.
-    pub fn pixels_to_instances_tiled(
+    /// A merged tile covers several cells, so there is no single 2x2 block to
+    /// resolve into quadrants — its whole area is averaged and drawn solid
+    /// (blocks) or mapped onto the ramp. Span-1 tiles keep the per-cell treatment.
+    pub fn subpixels_to_instances_tiled(
         &self,
         pixels: &[[u8; 4]],
         tiles: &[crate::ascii::Tile],
+        style: GlyphStyle,
     ) -> Vec<InstanceData> {
-        let cols = self.width;
-        let rows = self.height;
+        let cols = self.width / 2;
+        let rows = self.height / 2;
+        if cols == 0 || rows == 0 {
+            return Vec::new();
+        }
+
         let cell_w_ndc = 2.0 / cols as f32;
         let cell_h_ndc = 2.0 / rows as f32;
-
         let mut instances = Vec::with_capacity(tiles.len());
 
         for tile in tiles {
-            let [r, g, b] = crate::ascii::average_block_color(pixels, cols, rows, tile);
-            let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-            let glyph_index = crate::ascii::glyph_atlas::brightness_to_index(luminance);
+            let (glyph_index, color) = if tile.span == 1 {
+                let sub = crate::ascii::blocks::gather_subpixels(
+                    pixels, self.width, self.height, tile.col, tile.row,
+                );
+                self.style_glyph(&sub, style)
+            } else {
+                let avg = self.average_tile(pixels, tile);
+                match style {
+                    GlyphStyle::Blocks => (crate::ascii::block_glyph_index(0b1111), avg),
+                    GlyphStyle::Ramp => (
+                        crate::ascii::glyph_atlas::brightness_to_index(crate::ascii::luminance(avg)),
+                        avg,
+                    ),
+                }
+            };
 
             let span = tile.span as f32;
             instances.push(InstanceData {
@@ -391,13 +427,59 @@ impl AsciiProcessor {
                 width: cell_w_ndc * span,
                 height: cell_h_ndc * span,
                 glyph_index,
-                color_r: r,
-                color_g: g,
-                color_b: b,
+                color_r: color[0],
+                color_g: color[1],
+                color_b: color[2],
             });
         }
 
         instances
+    }
+
+    /// Glyph index and colour for one cell's 2x2 subpixel block.
+    fn style_glyph(
+        &self,
+        sub: &crate::ascii::blocks::Subpixels,
+        style: GlyphStyle,
+    ) -> (u32, [f32; 3]) {
+        match style {
+            GlyphStyle::Blocks => {
+                let cell = crate::ascii::blocks::classify(sub);
+                (crate::ascii::block_glyph_index(cell.pattern), cell.color)
+            }
+            GlyphStyle::Ramp => {
+                let avg = crate::ascii::blocks::average_subpixels(sub);
+                let lum = crate::ascii::luminance(avg);
+                (crate::ascii::glyph_atlas::brightness_to_index(lum), avg)
+            }
+        }
+    }
+
+    /// Mean colour of every subpixel a merged tile covers.
+    fn average_tile(&self, pixels: &[[u8; 4]], tile: &crate::ascii::Tile) -> [f32; 3] {
+        let mut sum = [0.0f32; 3];
+        let mut count = 0.0f32;
+        for dy in 0..(tile.span * 2) {
+            for dx in 0..(tile.span * 2) {
+                let x = tile.col * 2 + dx;
+                let y = tile.row * 2 + dy;
+                if x >= self.width || y >= self.height {
+                    continue;
+                }
+                let idx = (y as usize) * (self.width as usize) + (x as usize);
+                if let Some(p) = pixels.get(idx) {
+                    sum[0] += p[0] as f32 / 255.0;
+                    sum[1] += p[1] as f32 / 255.0;
+                    sum[2] += p[2] as f32 / 255.0;
+                    count += 1.0;
+                }
+            }
+        }
+        if count > 0.0 {
+            [sum[0] / count, sum[1] / count, sum[2] / count]
+        } else {
+            [0.0; 3]
+        }
     }
 
     /// Turn the opaque cells of a UI overlay into glyph instances.

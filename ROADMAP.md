@@ -68,6 +68,9 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 ### 3.1 Glyph System
 - [x] Dynamic cell grid (variable cell sizes — depth-driven merging, toggle: G)
 - [x] Procedural text font: hand-coded 5x7 bitmaps for printable ASCII
+- [x] Block Elements (U+2580–U+259F) with 2x supersampling: each cell resolves a
+      2x2 subpixel block into a quadrant glyph, doubling effective resolution
+      (toggle: B switches to the classic brightness ramp)
 - [ ] Extended Unicode set (CJK characters, emojis for fun)
 - [x] Color modes: ANSI 256, TrueColor (16M), ANSI 16, grayscale (cycle: M)
 - [ ] TTF font loading → bitmap atlas (optional — the procedural font above is
