@@ -22,6 +22,9 @@ pub struct FrameMetrics {
     drawn: usize,
     culled: usize,
     material_slots: usize,
+    /// Glyph quads submitted this frame. Below cols*rows when the dynamic cell
+    /// grid merged distant cells.
+    glyphs: usize,
 }
 
 impl FrameMetrics {
@@ -37,6 +40,7 @@ impl FrameMetrics {
             drawn: 0,
             culled: 0,
             material_slots: 0,
+            glyphs: 0,
         }
     }
 
@@ -45,6 +49,11 @@ impl FrameMetrics {
         self.drawn = drawn;
         self.culled = culled;
         self.material_slots = material_slots;
+    }
+
+    /// Record how many glyph quads were submitted this frame.
+    pub fn set_glyph_count(&mut self, glyphs: usize) {
+        self.glyphs = glyphs;
     }
 
     /// Call at the beginning of render().
@@ -75,13 +84,14 @@ impl FrameMetrics {
         if self.fps_accum >= 1.0 {
             self.fps = self.frame_count as f32 / self.fps_accum;
             eprintln!(
-                "FPS: {:.0}, CPU: {:.1}ms, GPU: {:.1}ms | drawn: {}, culled: {}, materials: {}",
+                "FPS: {:.0}, CPU: {:.1}ms, GPU: {:.1}ms | drawn: {}, culled: {}, materials: {}, glyphs: {}",
                 self.fps,
                 self.cpu_time_us as f32 / 1000.0,
                 self.gpu_time_us as f32 / 1000.0,
                 self.drawn,
                 self.culled,
                 self.material_slots,
+                self.glyphs,
             );
             self.frame_count = 0;
             self.fps_accum = 0.0;

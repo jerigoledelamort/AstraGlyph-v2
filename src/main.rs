@@ -83,6 +83,17 @@ impl ApplicationHandler for MainApp {
                     s.input_mut().mouse_button_event(button, mouse_state);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Line deltas come from a wheel, pixel deltas from a trackpad;
+                // normalize both to "notches" so camera zoom feels the same.
+                let notches = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 120.0,
+                };
+                if let Some(s) = self.state.borrow_mut().as_mut() {
+                    s.input_mut().mouse_wheel(notches);
+                }
+            }
             _ => {}
         }
     }

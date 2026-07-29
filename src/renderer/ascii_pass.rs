@@ -35,6 +35,15 @@ pub struct AsciiProcessor {
     /// freshly completed map yet, so callers always get a full frame instead
     /// of a partial/stale one.
     last_pixels: Vec<[u8; 4]>,
+    /// Depth readback, ping-ponged exactly like the colour slots above.
+    /// Depth32Float is 4 bytes per pixel, so the row padding differs from the
+    /// colour path only in that it holds f32 rather than RGBA8.
+    depth_slots: [ReadbackSlot; 2],
+    depth_write_index: usize,
+    depth_bytes_per_row: u32,
+    /// Most recently completed depth frame, 0..1 window-space depth
+    /// (1.0 = far plane / nothing drawn).
+    last_depth: Vec<f32>,
 }
 
 impl AsciiProcessor {
@@ -52,6 +61,18 @@ impl AsciiProcessor {
             })
         };
 
+        // Depth32Float is also 4 bytes per pixel, so the padded row size matches.
+        let depth_bytes_per_row = bytes_per_row;
+        let depth_buffer_size = (depth_bytes_per_row * height) as u64;
+        let make_depth_buffer = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: depth_buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+
         Self {
             slots: [
                 ReadbackSlot { buffer: make_buffer("ascii_readback_buffer_0"), pending: None },
@@ -63,6 +84,15 @@ impl AsciiProcessor {
             height,
             bytes_per_row,
             last_pixels: vec![[0, 0, 0, 255]; (width * height) as usize],
+            depth_slots: [
+                ReadbackSlot { buffer: make_depth_buffer("ascii_depth_readback_0"), pending: None },
+                ReadbackSlot { buffer: make_depth_buffer("ascii_depth_readback_1"), pending: None },
+            ],
+            depth_write_index: 0,
+            depth_bytes_per_row,
+            // 1.0 = far plane, i.e. "nothing here", the correct neutral value
+            // for SSAO and subdivision before the first frame lands.
+            last_depth: vec![1.0; (width * height) as usize],
         }
     }
 
@@ -102,6 +132,112 @@ impl AsciiProcessor {
         }
 
         self.last_pixels.clone()
+    }
+
+    /// Advance the double-buffered *depth* readback by one frame, mirroring
+    /// `read_pixels`. Returns the most recently completed depth frame as
+    /// window-space depth in 0..1 (1.0 = far plane / nothing drawn).
+    ///
+    /// Never blocks; the result may lag the current frame by roughly one frame,
+    /// which is harmless for the screen-space effects that consume it.
+    pub fn read_depth(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        depth_source: &wgpu::Texture,
+    ) -> Vec<f32> {
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        let read_index = 1 - self.depth_write_index;
+        if let Some(rx) = &self.depth_slots[read_index].pending {
+            if let Ok(result) = rx.try_recv() {
+                self.depth_slots[read_index].pending = None;
+                if result.is_ok() {
+                    self.extract_depth(read_index);
+                }
+                self.depth_slots[read_index].buffer.unmap();
+            }
+        }
+
+        if self.depth_slots[self.depth_write_index].pending.is_none() {
+            self.submit_depth_copy(device, queue, depth_source, self.depth_write_index);
+            self.depth_write_index = read_index;
+        }
+
+        self.last_depth.clone()
+    }
+
+    /// Copy the depth texture into `slot_index`'s buffer and start an async map.
+    fn submit_depth_copy(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        source: &wgpu::Texture,
+        slot_index: usize,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ascii_depth_readback_encoder"),
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.depth_slots[slot_index].buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.depth_bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let (tx, rx) = mpsc::channel();
+        self.depth_slots[slot_index]
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        self.depth_slots[slot_index].pending = Some(rx);
+    }
+
+    /// Decode the mapped depth bytes into `last_depth`, skipping row padding.
+    fn extract_depth(&mut self, slot_index: usize) {
+        let mapped = self.depth_slots[slot_index]
+            .buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("failed to map depth readback buffer for reading");
+        let mut depth = Vec::with_capacity((self.width * self.height) as usize);
+
+        for row in 0..self.height {
+            let row_start = (row * self.depth_bytes_per_row) as usize;
+            for col in 0..self.width {
+                let offset = row_start + (col * 4) as usize;
+                let bytes = [
+                    mapped[offset],
+                    mapped[offset + 1],
+                    mapped[offset + 2],
+                    mapped[offset + 3],
+                ];
+                depth.push(f32::from_le_bytes(bytes));
+            }
+        }
+
+        drop(mapped);
+        self.last_depth = depth;
     }
 
     /// Copy the scene texture into `slot_index`'s buffer and start an async map.
@@ -218,11 +354,107 @@ impl AsciiProcessor {
         instances
     }
 
+    /// Convert pixels to glyph instances using a non-uniform tile layout
+    /// (see `ascii::grid_layout`): merged tiles become one larger glyph whose
+    /// colour is the average of the block it covers.
+    ///
+    /// The uniform path (`pixels_to_instances`) is kept separate rather than
+    /// expressed as all-span-1 tiles, so the common case doesn't pay for
+    /// building and walking a tile list.
+    pub fn pixels_to_instances_tiled(
+        &self,
+        pixels: &[[u8; 4]],
+        tiles: &[crate::ascii::Tile],
+    ) -> Vec<InstanceData> {
+        let cols = self.width;
+        let rows = self.height;
+        let cell_w_ndc = 2.0 / cols as f32;
+        let cell_h_ndc = 2.0 / rows as f32;
+
+        let mut instances = Vec::with_capacity(tiles.len());
+
+        for tile in tiles {
+            let [r, g, b] = crate::ascii::average_block_color(pixels, cols, rows, tile);
+            let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+            let glyph_index = crate::ascii::glyph_atlas::brightness_to_index(luminance);
+
+            let span = tile.span as f32;
+            instances.push(InstanceData {
+                ndc_x: -1.0 + tile.col as f32 * cell_w_ndc,
+                ndc_y: 1.0 - tile.row as f32 * cell_h_ndc,
+                width: cell_w_ndc * span,
+                height: cell_h_ndc * span,
+                glyph_index,
+                color_r: r,
+                color_g: g,
+                color_b: b,
+            });
+        }
+
+        instances
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ascii::{compute_tiles, SubdivisionPolicy, Tile};
+
+    /// NDC placement maths, mirrored from `pixels_to_instances_tiled` so it can
+    /// be checked without a GPU device (constructing an AsciiProcessor needs one).
+    fn tile_rect(tile: &Tile, cols: u32, rows: u32) -> (f32, f32, f32, f32) {
+        let cell_w = 2.0 / cols as f32;
+        let cell_h = 2.0 / rows as f32;
+        (
+            -1.0 + tile.col as f32 * cell_w,
+            1.0 - tile.row as f32 * cell_h,
+            cell_w * tile.span as f32,
+            cell_h * tile.span as f32,
+        )
+    }
+
+    #[test]
+    fn merged_tiles_tile_the_screen_without_gaps() {
+        // A flat far frame merges into 2x2 tiles; the resulting quads must still
+        // exactly cover NDC -1..1 on both axes.
+        let (cols, rows) = (8u32, 8u32);
+        let depth = vec![1.0f32; (cols * rows) as usize];
+        let policy = SubdivisionPolicy { merge_depth: 0.9, depth_tolerance: 0.01, max_span: 2 };
+        let tiles = compute_tiles(&depth, cols, rows, &policy);
+
+        let mut area = 0.0f32;
+        for tile in &tiles {
+            let (x, y, w, h) = tile_rect(tile, cols, rows);
+            assert!(x >= -1.0 - 1e-6 && x + w <= 1.0 + 1e-6, "tile out of NDC on x: {x} + {w}");
+            assert!(y <= 1.0 + 1e-6 && y - h >= -1.0 - 1e-6, "tile out of NDC on y: {y} - {h}");
+            area += w * h;
+        }
+        assert!((area - 4.0).abs() < 1e-4, "quads must cover the full 2x2 NDC area, got {area}");
+    }
+
+    #[test]
+    fn a_merged_tile_is_twice_the_size_of_a_base_cell() {
+        let (cols, rows) = (4u32, 4u32);
+        let base = tile_rect(&Tile { col: 0, row: 0, span: 1 }, cols, rows);
+        let merged = tile_rect(&Tile { col: 0, row: 0, span: 2 }, cols, rows);
+        assert!((merged.2 - base.2 * 2.0).abs() < 1e-6);
+        assert!((merged.3 - base.3 * 2.0).abs() < 1e-6);
+        // Both anchor at the same top-left corner.
+        assert!((merged.0 - base.0).abs() < 1e-6);
+        assert!((merged.1 - base.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn first_cell_starts_at_the_top_left_of_ndc() {
+        let (x, y, _, _) = tile_rect(&Tile { col: 0, row: 0, span: 1 }, 10, 10);
+        assert!((x + 1.0).abs() < 1e-6, "x should start at -1");
+        assert!((y - 1.0).abs() < 1e-6, "y should start at +1");
     }
 }

@@ -712,6 +712,12 @@ impl ScenePipeline {
         MAX_OBJECTS
     }
 
+    /// The scene depth buffer. Exposed for CPU readback: screen-space effects
+    /// (SSAO, depth-driven cell subdivision) consume it on the ASCII side.
+    pub fn depth_texture(&self) -> &Texture {
+        &self.depth_texture
+    }
+
     /// Get or create cached GPU buffers (and centroid) for a mesh.
     fn get_or_create_buffers(
         &mut self,

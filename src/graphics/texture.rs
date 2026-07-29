@@ -27,6 +27,10 @@ pub fn render_target_texture(
 }
 
 /// Create a depth texture for depth testing in the scene pass.
+///
+/// `COPY_SRC` is included so the depth buffer can be read back to the CPU —
+/// screen-space effects such as SSAO and the depth-driven cell subdivision run
+/// on the CPU side of the ASCII pipeline.
 pub fn depth_texture(
     device: &Device,
     label: &str,
@@ -44,7 +48,7 @@ pub fn depth_texture(
         sample_count: 1,
         dimension: TextureDimension::D2,
         format: TextureFormat::Depth32Float,
-        usage: TextureUsages::RENDER_ATTACHMENT,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }

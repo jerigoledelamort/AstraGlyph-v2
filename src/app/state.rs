@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 use crate::engine::core::Result;
+use crate::ascii::{compute_tiles, ColorMode, SubdivisionPolicy};
 use crate::engine::math::{Mat4, Vec3};
 use crate::graphics::GraphicsContext;
 use crate::renderer::{AsciiProcessor, CompositePipeline, LightUniform, ObjectUniform, ScenePipeline};
@@ -108,6 +109,17 @@ fn next_mode(current: CameraMode) -> CameraMode {
     }
 }
 
+/// Cycle order for the colour-mode key, highest fidelity first.
+fn next_color_mode(current: ColorMode) -> ColorMode {
+    match current {
+        ColorMode::TrueColor => ColorMode::Ansi256,
+        ColorMode::Ansi256 => ColorMode::Ansi16,
+        ColorMode::Ansi16 => ColorMode::Grayscale,
+        ColorMode::Grayscale => ColorMode::Monochrome,
+        ColorMode::Monochrome => ColorMode::TrueColor,
+    }
+}
+
 /// Build a first-person rig that reproduces an existing camera's viewpoint.
 ///
 /// The rig stores orientation as yaw/pitch, so they have to be recovered from
@@ -188,6 +200,15 @@ pub struct AppState {
     /// Culling stats for the current frame, logged alongside the FPS line.
     drawn_count: usize,
     culled_count: usize,
+    /// Dynamic cell-grid policy. Toggled at runtime with G; when it merges,
+    /// the depth buffer is read back to drive the subdivision.
+    subdivision: SubdivisionPolicy,
+    /// Latch for the subdivision toggle key.
+    grid_key_was_down: bool,
+    /// Colour fidelity the cells are quantized to. Cycled at runtime with M.
+    color_mode: ColorMode,
+    /// Latch for the colour-mode key.
+    color_key_was_down: bool,
 }
 
 impl AppState {
@@ -247,6 +268,14 @@ impl AppState {
             grid_rows,
             drawn_count: 0,
             culled_count: 0,
+            // Off by default so the baseline image is the plain uniform grid;
+            // press G to see the merged layout.
+            subdivision: SubdivisionPolicy::uniform(),
+            grid_key_was_down: false,
+            // Full 24-bit colour by default; M cycles down through the
+            // lower-fidelity terminal palettes.
+            color_mode: ColorMode::TrueColor,
+            color_key_was_down: false,
         })
     }
 
@@ -276,6 +305,29 @@ impl AppState {
         // the camera (its projection is left alone).
         self.camera_input.update(&mut self.camera_rig, &mut self.input, dt);
         self.camera_rig.apply_to(&mut self.camera);
+
+        // G toggles the dynamic cell grid (edge-triggered).
+        let grid_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyG);
+        if grid_key_down && !self.grid_key_was_down {
+            self.subdivision = if self.subdivision.merges() {
+                SubdivisionPolicy::uniform()
+            } else {
+                SubdivisionPolicy::default()
+            };
+            eprintln!(
+                "grid: dynamic cell merging {}",
+                if self.subdivision.merges() { "ON" } else { "OFF" }
+            );
+        }
+        self.grid_key_was_down = grid_key_down;
+
+        // M cycles the colour mode (edge-triggered).
+        let color_key_down = self.input.is_key_pressed(winit::keyboard::KeyCode::KeyM);
+        if color_key_down && !self.color_key_was_down {
+            self.color_mode = next_color_mode(self.color_mode);
+            eprintln!("color: mode = {:?}", self.color_mode);
+        }
+        self.color_key_was_down = color_key_down;
 
         // Update scene uniforms.
         self.scene_pipeline.update_camera(&self.graphics.queue, &self.camera);
@@ -371,9 +423,36 @@ impl AppState {
             &self.scene_pipeline.target_texture,
         );
 
-        // Convert pixels to glyph instance data.
+        // Convert pixels to glyph instance data. With a merging policy active,
+        // depth decides which cells collapse into larger glyphs — so the depth
+        // buffer is only read back when it will actually be used.
         let (sw, sh) = self.graphics.size();
-        let instances = self.ascii_processor.pixels_to_instances(&pixels, sw, sh);
+        let mut instances = if self.subdivision.merges() {
+            let depth = self.ascii_processor.read_depth(
+                &self.graphics.device,
+                &self.graphics.queue,
+                self.scene_pipeline.depth_texture(),
+            );
+            let tiles = compute_tiles(&depth, self.grid_cols, self.grid_rows, &self.subdivision);
+            self.ascii_processor.pixels_to_instances_tiled(&pixels, &tiles)
+        } else {
+            self.ascii_processor.pixels_to_instances(&pixels, sw, sh)
+        };
+
+        // Quantize to the selected colour fidelity. Done on the instances rather
+        // than the pixel buffer so the glyph choice still comes from the full
+        // resolution luminance — dropping the palette should change colour, not
+        // which character is drawn.
+        if self.color_mode != ColorMode::TrueColor {
+            for inst in &mut instances {
+                let [r, g, b] = self
+                    .color_mode
+                    .quantize([inst.color_r, inst.color_g, inst.color_b]);
+                inst.color_r = r;
+                inst.color_g = g;
+                inst.color_b = b;
+            }
+        }
         let instance_count = instances.len() as u32;
 
         // Update instance buffer.
@@ -400,6 +479,7 @@ impl AppState {
             self.culled_count,
             self.materials.len(),
         );
+        self.metrics.set_glyph_count(instance_count as usize);
         self.metrics.end_frame();
 
         Ok(())

@@ -21,44 +21,44 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 
 ---
 
-## 🚧 Phase 1: Solid Renderer 🧱
+## ✅ Phase 1: Solid Renderer 🧱
 *Make the renderer high-quality and performant.*
 
 ### 1.1 Depth & Sorting
-- [ ] Add depth buffer to scene pass
-- [ ] Correct face sorting (back-to-front for transparent, depth test for opaque)
-- [ ] Fix z-fighting for Cornell Box walls
+- [x] Add depth buffer to scene pass
+- [x] Correct face sorting (back-to-front for transparent, depth test for opaque)
+- [x] Fix z-fighting for Cornell Box walls
 
 ### 1.2 Performance
-- [ ] Cache GPU buffers (don't re-upload every frame)
-- [ ] Async GPU readback (double-buffered, no CPU stalls)
-- [ ] Measure and log FPS, GPU frame time, CPU frame time
+- [x] Cache GPU buffers (don't re-upload every frame)
+- [x] Async GPU readback (double-buffered, no CPU stalls)
+- [x] Measure and log FPS, GPU frame time, CPU frame time
 
 ### 1.3 Lighting
-- [ ] Phong shading (ambient + diffuse + specular)
-- [ ] Multiple light sources (directional, point)
-- [ ] Shadow maps → ASCII (simplified)
-- [ ] Per-mesh material colors (already in vertex data, needs shader integration)
+- [x] Phong shading (ambient + diffuse + specular)
+- [x] Multiple light sources (directional, point)
+- [x] Shadow maps → ASCII (simplified — one shadow-casting light)
+- [x] Per-mesh material colors (Matte / Mirror / Glass via a material storage buffer)
 
 ---
 
-## 🎬 Phase 2: Scene System 🎬
+## ✅ Phase 2: Scene System 🎬
 *Transform raw meshes into a manageable scene graph.*
 
 ### 2.1 Transforms
-- [ ] Model matrix in scene vertex shader
-- [ ] TransformComponent with position, rotation, scale
-- [ ] Parent/child hierarchy (world matrix = parent_world × local)
+- [x] Model matrix in scene vertex shader
+- [x] TransformComponent with position, rotation, scale
+- [x] Parent/child hierarchy (world matrix = parent_world × local)
 
 ### 2.2 Scene Management
-- [ ] Load scenes from JSON/TOML files
-- [ ] Material registry (shared materials, no duplication)
-- [ ] Frustum culling (skip meshes outside camera FOV)
+- [x] Load scenes from JSON files (hand-written parser, no serde)
+- [x] Material registry (shared materials, no duplication)
+- [x] Frustum culling (skip meshes outside camera FOV)
 
 ### 2.3 Camera
-- [ ] Orthographic projection support
-- [ ] Camera presets (first-person, third-person, orbit)
-- [ ] Smooth camera transitions (dampening)
+- [x] Orthographic projection support
+- [x] Camera presets (first-person, third-person, orbit)
+- [x] Smooth camera transitions (dampening)
 
 ---
 
