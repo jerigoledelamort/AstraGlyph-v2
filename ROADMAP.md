@@ -92,46 +92,91 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 
 ---
 
-## 🎮 Phase 4: Game Engine Foundations 🎮
+## 🔷 Phase 4: Hardware Ray Tracing (RTX) 🔷
+*The engine's stated goal — "quality lighting on ASCII graphics" — cashed out.*
+
+Until now lighting has been rasterised: one simplified shadow map, an analytic
+sky for "reflections", and a refraction that bends the view ray but samples that
+same procedural sky. Mirrors do not reflect the scene and glass does not show
+what is actually behind it, because a fragment shader cannot know what lies along
+a reflected ray. Tracing is what closes that gap, and it is the reason the rest
+of the renderer exists.
+
+Hardware path: wgpu 30 exposes `EXPERIMENTAL_RAY_QUERY` (and
+`EXPERIMENTAL_RAY_TRACING_PIPELINES`) behind `ExperimentalFeatures`, giving WGSL
+ray queries against a GPU acceleration structure on Vulkan/DX12 — i.e. real RTX
+cores on the target hardware.
+
+### 4.1 Acceleration Structure
+- [ ] Feature detection: request `EXPERIMENTAL_RAY_QUERY`, report what the
+      adapter actually supports, and fall back cleanly when it does not
+- [ ] Build BLAS per mesh from the existing vertex/index buffers
+- [ ] Build and update a TLAS from the scene's per-object model matrices
+- [ ] Rebuild only what moved (static geometry must not be re-built per frame)
+
+### 4.2 Traced Lighting
+- [ ] Ray-traced shadows: one shadow ray per light, replacing the single
+      simplified shadow map (and its self-shadowing bias problems)
+- [ ] Ray-traced reflections: mirrors reflect actual scene geometry, with
+      reflectivity and Fresnel already present in the material
+- [ ] Ray-traced refraction: glass shows the geometry behind it, bent by its IOR,
+      with total internal reflection
+- [ ] Bounded recursion depth, configurable, so cost stays predictable
+
+### 4.3 Quality & Integration
+- [ ] Soft shadows from area/point lights (multiple rays, documented sample count)
+- [ ] Ambient occlusion from traced rays, replacing the screen-space approximation
+- [ ] Toggle between rasterised and traced lighting at runtime for A/B comparison
+- [ ] HUD/console report which path is active and the ray budget per frame
+
+### 4.4 CPU Fallback
+- [ ] Analytic CPU tracer over spheres/planes for machines without ray query
+      support, sharing the intersection maths with gameplay raycasting (5.1)
+- [ ] Same visual features, lower resolution/ray count, so the demo still shows
+      real reflections everywhere
+
+---
+
+## 🎮 Phase 5: Game Engine Foundations 🎮
 *Graphics engine → general-purpose game engine.*
 
-### 4.1 Physics
+### 5.1 Physics
 - [ ] Collision detection (AABB, OBB, sphere)
 - [ ] Rigid body simulation (self-written, no physics library)
 - [ ] Raycasting for gameplay (click-to-move, line of sight)
 
-### 4.2 Audio
+### 5.2 Audio
 - [ ] Sound playback (WAV, OGG)
 - [ ] 3D spatial audio
 - [ ] Music streaming
 
-### 4.3 Scripting
+### 5.3 Scripting
 - [ ] Lua integration (self-written bindings)
 - [ ] Game logic in Lua (entity behaviors, triggers)
 - [ ] Hot-reload Lua scripts
 
-### 4.4 ECS Overhaul
+### 5.4 ECS Overhaul
 - [ ] Archetype-based ECS (for cache-friendly iteration)
 - [ ] Component queries (filter by component types)
 - [ ] System pipeline (update order, dependencies)
 
 ---
 
-## 🛠️ Phase 5: Tooling 🛠️
+## 🛠️ Phase 6: Tooling 🛠️
 *Developer tools for a better workflow.*
 
-### 5.1 Scene Editor
+### 6.1 Scene Editor
 - [ ] Separate window for scene editing
 - [ ] Drag-and-drop entity placement
 - [ ] Transform gizmo (move, rotate, scale widgets)
 - [ ] Property inspector (edit component values)
 
-### 5.2 Asset Pipeline
+### 6.2 Asset Pipeline
 - [ ] Model loader (OBJ, glTF — parse manually)
 - [ ] Texture loader (PNG, JPEG → wgpu textures)
 - [ ] Asset hot-reload (edit assets without restarting)
 
-### 5.3 Profiler
+### 6.3 Profiler
 - [ ] FPS overlay with frame breakdown
 - [ ] GPU timing (render pass, readback, composite)
 - [ ] Memory usage tracking
