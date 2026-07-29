@@ -1,6 +1,7 @@
 // Component trait and built-in component types.
 // Components are plain data structs; systems interpret them.
 
+use crate::engine::geometry::Shape;
 use crate::engine::math::{Mat4, Transform, Vec3, Vec4};
 
 /// Marker trait for data that can be used as a component.
@@ -42,6 +43,33 @@ impl MeshComponent {
 }
 
 impl Component for MeshComponent {}
+
+/// The analytic shape an entity's mesh approximates, in the entity's local space.
+///
+/// Attached alongside `MeshComponent` by every scene source (the loader and the
+/// code-built demos), because two subsystems need the equation rather than the
+/// triangles:
+///
+/// - The CPU fallback tracer solves one quadratic per sphere instead of walking
+///   1536 triangles per ray, which is the difference between an interactive
+///   fallback and a slideshow.
+/// - Physics needs a collision volume, and mesh-mesh collision is a different
+///   project entirely.
+///
+/// One component serves both so a collider can never disagree with what the
+/// tracer reflects.
+#[derive(Clone, Copy, Debug)]
+pub struct ColliderComponent {
+    pub shape: Shape,
+}
+
+impl ColliderComponent {
+    pub const fn new(shape: Shape) -> Self {
+        Self { shape }
+    }
+}
+
+impl Component for ColliderComponent {}
 
 /// A single vertex for 3D rendering.
 #[repr(C)]

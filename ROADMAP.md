@@ -92,7 +92,7 @@ The journey from an ASCII rendering experiment to a full-featured game engine.
 
 ---
 
-## 🔷 Phase 4: Hardware Ray Tracing (RTX) 🔷
+## ✅ Phase 4: Hardware Ray Tracing (RTX) 🔷
 *The engine's stated goal — "quality lighting on ASCII graphics" — cashed out.*
 
 Until now lighting has been rasterised: one simplified shadow map, an analytic
@@ -108,32 +108,50 @@ ray queries against a GPU acceleration structure on Vulkan/DX12 — i.e. real RT
 cores on the target hardware.
 
 ### 4.1 Acceleration Structure
-- [ ] Feature detection: request `EXPERIMENTAL_RAY_QUERY`, report what the
+- [x] Feature detection: request `EXPERIMENTAL_RAY_QUERY`, report what the
       adapter actually supports, and fall back cleanly when it does not
-- [ ] Build BLAS per mesh from the existing vertex/index buffers
-- [ ] Build and update a TLAS from the scene's per-object model matrices
-- [ ] Rebuild only what moved (static geometry must not be re-built per frame)
+      (`ASTRAGLYPH_NO_RAYTRACING=1` forces the fallback on capable hardware, so
+      that path stays exercised)
+- [x] Build BLAS per mesh from a shared vertex/index heap — *not* from the
+      rasteriser's cached buffers: a hit shader has to read the same geometry
+      back, and it cannot index an array of bindings without `BINDING_ARRAY`
+- [x] Build and update a TLAS from the scene's per-object model matrices
+- [x] Rebuild only what moved. Measured: 5 BLAS builds and 1 TLAS build at
+      startup, both unchanged 400 frames later, TLAS → 2 after one object moved
 
 ### 4.2 Traced Lighting
-- [ ] Ray-traced shadows: one shadow ray per light, replacing the single
+- [x] Ray-traced shadows: one shadow ray per light, replacing the single
       simplified shadow map (and its self-shadowing bias problems)
-- [ ] Ray-traced reflections: mirrors reflect actual scene geometry, with
+- [x] Ray-traced reflections: mirrors reflect actual scene geometry, with
       reflectivity and Fresnel already present in the material
-- [ ] Ray-traced refraction: glass shows the geometry behind it, bent by its IOR,
+- [x] Ray-traced refraction: glass shows the geometry behind it, bent by its IOR,
       with total internal reflection
-- [ ] Bounded recursion depth, configurable, so cost stays predictable
+- [x] Bounded depth, configurable (`depth 0..4` in the console). Iterative, not
+      recursive — WGSL has no recursion — and single-path, so a mirror reflecting
+      glass reflecting a mirror costs one ray per bounce, not two to the power
 
 ### 4.3 Quality & Integration
-- [ ] Soft shadows from area/point lights (multiple rays, documented sample count)
-- [ ] Ambient occlusion from traced rays, replacing the screen-space approximation
-- [ ] Toggle between rasterised and traced lighting at runtime for A/B comparison
-- [ ] HUD/console report which path is active and the ray budget per frame
+- [x] Soft shadows from area/point lights (`shadow_samples`, default 2, jittered
+      inside a cone of the light's apparent angular radius; `samples shadow <n>`)
+- [x] Ambient occlusion from traced rays (`ao_samples`, default 4), replacing the
+      screen-space approximation — which is suppressed while tracing, because
+      stacking the two darkens every crease twice
+- [x] Toggle between rasterised and traced lighting at runtime (R, the menu, or
+      `trace on|off`) for A/B comparison
+- [x] HUD/console report which path is active and the ray budget per frame
+      (`rays` prints the acceleration-structure and sampler state too)
 
 ### 4.4 CPU Fallback
-- [ ] Analytic CPU tracer over spheres/planes for machines without ray query
-      support, sharing the intersection maths with gameplay raycasting (5.1)
-- [ ] Same visual features, lower resolution/ray count, so the demo still shows
-      real reflections everywhere
+- [x] Analytic CPU tracer over spheres/planes/boxes for machines without ray
+      query. The intersection maths lives in `engine/geometry/`, shared with
+      gameplay raycasting (5.1), and the shapes come from `ColliderComponent`,
+      the same source physics uses — so a reflection can never disagree with a
+      collision
+- [x] Same visual features (reflections, refraction with TIR, soft shadows,
+      traced AO) at half resolution, multithreaded over rows with
+      `std::thread::scope`. Measured 452-480 FPS against 1320 for the hardware
+      path; its camera basis matches the rasteriser's to within 0.31 px on a
+      240-pixel-wide target
 
 ---
 

@@ -1,11 +1,36 @@
 // Primitive mesh generators: sphere, plane, etc.
 // All generators produce MeshComponent with computed normals and vertex colors.
 
+use crate::engine::geometry::Shape;
 use crate::engine::math::Vec3;
 use crate::scene::{MeshComponent, MeshVertex};
 
 /// Standard constant for PI.
 const PI: f32 = std::f32::consts::PI;
+
+/// The analytic shape a `sphere` mesh approximates.
+///
+/// Paired with the generator rather than derived from the mesh afterwards: the
+/// radius is known exactly here and only approximately from 1536 triangles, and
+/// the CPU tracer and the physics collider both need the exact value. Deriving
+/// it back out of the vertices would reproduce the tessellation error in every
+/// consumer.
+pub const fn sphere_shape(radius: f32) -> Shape {
+    Shape::Sphere { radius }
+}
+
+/// The analytic shape a `plane` mesh of side `size` approximates.
+pub const fn plane_shape(size: f32) -> Shape {
+    Shape::Plane {
+        normal: Vec3::UNIT_Y,
+        half_size: size * 0.5,
+    }
+}
+
+/// The analytic shape a box mesh of the given half-extents approximates.
+pub const fn box_shape(half_extents: Vec3) -> Shape {
+    Shape::Box { half_extents }
+}
 
 /// Generate a UV-sphere mesh centered at `center` with the given radius.
 ///

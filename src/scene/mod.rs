@@ -24,8 +24,13 @@ pub use frustum::{Aabb, Frustum, Plane};
 pub use loader::{load_scene_file, parse_scene, LoadedScene};
 #[allow(unused_imports)]
 pub use component::{
-    MaterialComponent, MaterialType, MaterialUniform, MeshComponent, MeshVertex, TransformComponent,
+    ColliderComponent, MaterialComponent, MaterialType, MaterialUniform, MeshComponent, MeshVertex,
+    TransformComponent,
 };
 pub use entity::Entity;
-pub use primitives::{plane, sphere};
+// `box_shape` is exported from `primitives` but not re-exported here: the only
+// box geometry in the engine is the Cornell Box demo, which bakes world
+// positions into its vertices instead of using transforms, so a local-space
+// collider would sit at the origin rather than at the wall.
+pub use primitives::{plane, plane_shape, sphere, sphere_shape};
 pub use scene::Scene;

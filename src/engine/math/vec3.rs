@@ -97,6 +97,24 @@ impl Mul<f32> for Vec3 {
     }
 }
 
+/// Component-wise product.
+///
+/// The Hadamard product rather than the dot or cross product, because the one
+/// place `Vec3 * Vec3` is written in this engine is colour arithmetic — an
+/// albedo filtering a light, a throughput accumulating along a traced path —
+/// where each channel is independent. `dot` and `cross` stay named methods so
+/// no reader has to guess which product an operator meant.
+impl Mul for Vec3 {
+    type Output = Self;
+    fn mul(self, other: Self) -> Self {
+        Self {
+            x: self.x * other.x,
+            y: self.y * other.y,
+            z: self.z * other.z,
+        }
+    }
+}
+
 impl Div<f32> for Vec3 {
     type Output = Self;
     fn div(self, s: f32) -> Self {
@@ -202,5 +220,21 @@ mod tests {
         assert_eq!(v * 2.0, Vec3::new(2.0, 4.0, 6.0));
         assert_eq!(-v, Vec3::new(-1.0, -2.0, -3.0));
         assert_eq!(v / 2.0, Vec3::new(0.5, 1.0, 1.5));
+    }
+
+    /// `Vec3 * Vec3` must be component-wise, not a dot or cross product. A
+    /// silent dot product would make every colour in the tracer grey; a silent
+    /// cross product would make them arbitrary.
+    #[test]
+    fn vec3_times_vec3_is_component_wise() {
+        let a = Vec3::new(1.0, 2.0, 3.0);
+        let b = Vec3::new(4.0, 5.0, 6.0);
+        assert_eq!(a * b, Vec3::new(4.0, 10.0, 18.0));
+        // White is the identity, which is what makes it usable as a throughput.
+        assert_eq!(a * Vec3::ONE, a);
+        assert_eq!(a * Vec3::ZERO, Vec3::ZERO);
+        // Distinguishable from the other two products.
+        assert_ne!((a * b).x, a.dot(b));
+        assert_ne!(a * b, a.cross(b));
     }
 }

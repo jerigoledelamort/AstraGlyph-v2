@@ -11,11 +11,12 @@
 // TransformComponent, so this scene also exercises the model-matrix path
 // (Phase 2.1) rather than baking world positions into vertex data.
 
+use crate::engine::geometry::Shape;
 use crate::engine::math::{radians, Transform, Vec3, Vec4};
 use crate::renderer::LightUniform;
 use crate::scene::{
-    plane, sphere, Camera, Entity, MaterialComponent, MeshComponent, Projection, Scene,
-    TransformComponent,
+    plane, plane_shape, sphere, sphere_shape, Camera, ColliderComponent, Entity, MaterialComponent,
+    MeshComponent, Projection, Scene, TransformComponent,
 };
 
 /// Build the material spheres demo scene.
@@ -30,6 +31,7 @@ pub fn build_scene() -> (Scene, Camera) {
     add_mesh_entity(
         &mut scene,
         ground,
+        plane_shape(50.0),
         MaterialComponent::matte(Vec4::new(0.8, 0.8, 0.8, 1.0), 0.15, 0.85),
         Transform {
             position: Vec3::new(0.0, -2.0, 0.0),
@@ -51,6 +53,7 @@ pub fn build_scene() -> (Scene, Camera) {
     add_mesh_entity(
         &mut scene,
         unit_sphere(Vec3::new(0.85, 0.1, 0.1)),
+        sphere_shape(1.0),
         MaterialComponent::matte(Vec4::new(0.85, 0.1, 0.1, 1.0), 0.1, 0.9),
         placed(Vec3::new(-2.5, -0.5, 0.0)),
     );
@@ -59,6 +62,7 @@ pub fn build_scene() -> (Scene, Camera) {
     add_mesh_entity(
         &mut scene,
         unit_sphere(Vec3::new(0.1, 0.2, 0.85)),
+        sphere_shape(1.0),
         MaterialComponent::mirror(Vec4::new(0.1, 0.2, 0.85, 1.0), 0.8),
         placed(Vec3::new(2.5, -0.5, 0.0)),
     );
@@ -67,6 +71,7 @@ pub fn build_scene() -> (Scene, Camera) {
     add_mesh_entity(
         &mut scene,
         unit_sphere(Vec3::new(0.1, 0.75, 0.2)),
+        sphere_shape(1.0),
         MaterialComponent::glass(Vec4::new(0.1, 0.75, 0.2, 1.0), 1.5, 0.8),
         placed(Vec3::new(0.0, -0.5, -2.5)),
     );
@@ -103,11 +108,15 @@ pub fn lights() -> Vec<LightUniform> {
 fn add_mesh_entity(
     scene: &mut Scene,
     mesh: MeshComponent,
+    shape: Shape,
     material: MaterialComponent,
     transform: Transform,
 ) -> Entity {
     let entity = scene.create_entity();
     scene.add_component(entity, mesh);
+    // The analytic form of the same geometry, for the CPU tracer and physics.
+    // Attached here rather than derived later so it cannot disagree with the mesh.
+    scene.add_component(entity, ColliderComponent::new(shape));
     scene.add_component(entity, material);
     scene.add_component(entity, TransformComponent { local: transform });
     entity

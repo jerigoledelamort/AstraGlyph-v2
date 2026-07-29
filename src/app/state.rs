@@ -7,13 +7,13 @@ use crate::ascii::{compute_tiles, ColorMode, Overlay, OverlayCell, SubdivisionPo
 use crate::engine::math::{degrees, radians, Mat4, Vec3};
 use crate::graphics::{FrameOutcome, GraphicsContext};
 use crate::renderer::{
-    post_process, trace_flags, AsciiProcessor, CompositePipeline, DepthBuffer, FrameBuffer,
-    GlyphStyle, InstanceRequest, LightUniform, ObjectUniform, PostProcessSettings, RayTracer,
-    ScenePipeline, TraceSettings,
+    cpu_trace, post_process, trace_flags, AsciiProcessor, CompositePipeline, CpuObject, CpuScene,
+    CpuTracer, DepthBuffer, FrameBuffer, GlyphStyle, InstanceRequest, LightUniform, ObjectUniform,
+    PostProcessSettings, RayTracer, ScenePipeline, TraceSettings,
 };
 use crate::scene::{
-    Aabb, Camera, CameraMode, CameraRig, Entity, Frustum, Hierarchy, MaterialComponent,
-    MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
+    Aabb, Camera, CameraMode, CameraRig, ColliderComponent, Entity, Frustum, Hierarchy,
+    MaterialComponent, MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
 };
 use crate::demo::material_spheres;
 use crate::ui::{Console, ConsoleAction, Menu, MenuAction, MenuEvent, MenuItem};
@@ -166,6 +166,22 @@ fn seed_rig_from_camera(camera: &Camera) -> CameraRig {
 /// grid on each axis, giving every cell a 2x2 block of subpixels.
 const SUBSAMPLE: u32 = 2;
 
+/// Which lighting path produces a frame.
+///
+/// Three states rather than a boolean because "traced" is two different
+/// implementations with different costs and different resolutions, and the HUD
+/// has to be able to say which one is running. Reporting a CPU trace as "RTX"
+/// would make a fallback indistinguishable from the real thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LightingPath {
+    /// Rasterised: shadow map, analytic environment for reflections.
+    Raster,
+    /// Hardware ray query in the fragment shader.
+    Gpu,
+    /// Analytic CPU tracer at reduced resolution.
+    Cpu,
+}
+
 /// The settings menu. Item ids are the contract between the menu and
 /// `apply_menu_event`, so they are defined here in one place.
 fn build_menu() -> Menu {
@@ -259,6 +275,13 @@ pub struct AppState {
     /// ray query, which is what makes the whole traced path optional rather than
     /// a hard requirement.
     ray_tracer: Option<RayTracer>,
+    /// Analytic fallback tracer, present only when there is no hardware ray
+    /// query. Phase 4.4: the traced *look* must survive on hardware that cannot
+    /// trace, or the feature only exists for people who already have an RTX card.
+    cpu_tracer: Option<CpuTracer>,
+    /// Reused between frames so a frame does not rebuild the object list from
+    /// scratch allocations.
+    cpu_scene: CpuScene,
     /// Ray budget and feature flags for the traced path.
     trace_settings: TraceSettings,
     /// Whether the traced path is active this frame. Toggled with R for the
@@ -412,14 +435,25 @@ impl AppState {
 
         let camera_rig = seed_rig_from_camera(&camera);
 
-        // Tracing is the default whenever the hardware allows it: it is the point
-        // of the phase, and R switches back to rasterising for comparison.
-        let traced_enabled = ray_tracer.is_some() && scene_pipeline.supports_tracing();
+        // No hardware ray query means the analytic CPU tracer instead. Exactly one
+        // of the two exists at a time, so "which tracer" is never ambiguous.
+        let cpu_tracer = if ray_tracer.is_some() {
+            None
+        } else {
+            Some(CpuTracer::new(cpu_trace::DEFAULT_SCALE))
+        };
+
+        // Tracing is the default on either path: it is the point of the phase,
+        // and R switches back to rasterising for comparison.
+        let traced_enabled = (ray_tracer.is_some() && scene_pipeline.supports_tracing())
+            || cpu_tracer.is_some();
 
         Ok(Self {
             graphics,
             scene_pipeline,
             ray_tracer,
+            cpu_tracer,
+            cpu_scene: CpuScene::default(),
             trace_settings: TraceSettings::default(),
             traced_enabled,
             trace_key_was_down: false,
@@ -686,6 +720,7 @@ impl AppState {
         let mut meshes: Vec<(_, _, u32)> = Vec::new();
         let mut objects: Vec<ObjectUniform> = Vec::new();
         let mut all_instances: Vec<(InstanceRequest, &MeshComponent)> = Vec::new();
+        let mut cpu_objects: Vec<CpuObject> = Vec::new();
         self.materials.clear();
         let mut scene_bounds: Option<Aabb> = None;
         let mut culled = 0usize;
@@ -723,6 +758,21 @@ impl AppState {
                 mesh,
             ));
 
+            // Analytic form of the same object, for the CPU fallback tracer.
+            // Collected here rather than in a separate pass so the two tracers
+            // see the same object list, culled the same way (i.e. not at all).
+            if let Some(collider) = self.scene.get_component::<ColliderComponent>(entity) {
+                cpu_objects.push(CpuObject {
+                    shape: collider.shape.transformed(&model),
+                    material: self
+                        .materials
+                        .uniforms()
+                        .get(material_index as usize)
+                        .copied()
+                        .unwrap_or_default(),
+                });
+            }
+
             if !frustum.intersects_aabb(&world_bounds) {
                 culled += 1;
                 continue;
@@ -743,12 +793,17 @@ impl AppState {
         // culling it out of the TLAS would make reflections pop in and out as the
         // camera turns — the same class of bug the shadow frustum already avoids
         // by accumulating bounds over all meshes.
-        let traced_active = self.traced_enabled && self.ray_tracer.is_some();
+        let path = self.lighting_path();
+        let traced_active = path == LightingPath::Gpu;
         if traced_active {
             if let Some(rt) = self.ray_tracer.as_mut() {
                 rt.update(&self.graphics.device, &self.graphics.queue, &all_instances);
                 rt.upload_settings(&self.graphics.queue, &self.trace_settings);
             }
+        }
+        if path == LightingPath::Cpu {
+            self.cpu_scene.objects = cpu_objects;
+            self.cpu_scene.lights = self.lights.clone();
         }
 
         // Upload per-object transforms and deduplicated materials to the GPU.
@@ -786,6 +841,24 @@ impl AppState {
             &self.graphics.queue,
             &self.scene_pipeline.target_texture,
         );
+
+        // The CPU fallback replaces the rasterised image outright: it casts primary
+        // rays too, because there is no per-fragment shader to start from. The
+        // raster pass still ran, and its depth buffer is still what the dynamic
+        // grid and SSAO consume — only the colour is overwritten.
+        if path == LightingPath::Cpu && !self.cpu_scene.is_empty() {
+            if let Some(tracer) = self.cpu_tracer.as_mut() {
+                let traced = tracer.render(
+                    &self.cpu_scene,
+                    &self.camera,
+                    self.grid_cols * SUBSAMPLE,
+                    self.grid_rows * SUBSAMPLE,
+                    &self.trace_settings,
+                );
+                pixels.clear();
+                pixels.extend_from_slice(traced);
+            }
+        }
 
         // Depth is needed by the dynamic grid and by SSAO; read it back once if
         // either of them wants it, and skip the transfer entirely otherwise.
@@ -919,9 +992,26 @@ impl AppState {
         self.metrics.fps()
     }
 
-    /// Whether the traced path can be switched on at all on this machine.
+    /// Whether tracing can be switched on at all on this machine — by either
+    /// implementation. There is always one: the CPU tracer exists precisely so
+    /// the answer is never "no".
     fn tracing_available(&self) -> bool {
-        self.ray_tracer.is_some() && self.scene_pipeline.supports_tracing()
+        (self.ray_tracer.is_some() && self.scene_pipeline.supports_tracing())
+            || self.cpu_tracer.is_some()
+    }
+
+    /// The path this frame will actually take.
+    fn lighting_path(&self) -> LightingPath {
+        if !self.traced_enabled {
+            return LightingPath::Raster;
+        }
+        if self.ray_tracer.is_some() && self.scene_pipeline.supports_tracing() {
+            LightingPath::Gpu
+        } else if self.cpu_tracer.is_some() {
+            LightingPath::Cpu
+        } else {
+            LightingPath::Raster
+        }
     }
 
     /// Flip between rasterised and traced lighting, reporting the result.
@@ -938,32 +1028,49 @@ impl AppState {
             return;
         }
         self.traced_enabled = !self.traced_enabled;
-        eprintln!(
-            "raytracing: lighting = {}",
-            if self.traced_enabled { "TRACED" } else { "RASTER" }
-        );
+        eprintln!("raytracing: lighting = {}", self.lighting_summary());
     }
 
     /// Short description of the active lighting path plus its ray budget, for
     /// the HUD and the console.
     fn lighting_summary(&self) -> String {
-        if !self.tracing_available() {
-            return format!("RASTER ({})", self.graphics.ray_tracing().tag());
-        }
-        if !self.traced_enabled {
-            return "RASTER (RTX IDLE)".to_string();
-        }
         let lights = self.lights.len().min(crate::renderer::scene_pass::MAX_LIGHTS) as u32;
         let rays = self.trace_settings.rays_per_fragment(lights);
-        let tris = self
-            .ray_tracer
-            .as_ref()
-            .map(|rt| rt.triangle_count())
-            .unwrap_or(0);
-        format!(
-            "TRACED d{} {} rays/px {} tris",
-            self.trace_settings.max_depth, rays, tris
-        )
+        match self.lighting_path() {
+            LightingPath::Raster => {
+                if self.tracing_available() {
+                    format!("RASTER ({} IDLE)", self.graphics.ray_tracing().tag())
+                } else {
+                    format!("RASTER ({})", self.graphics.ray_tracing().tag())
+                }
+            }
+            LightingPath::Gpu => {
+                let tris = self
+                    .ray_tracer
+                    .as_ref()
+                    .map(|rt| rt.triangle_count())
+                    .unwrap_or(0);
+                format!(
+                    "RTX d{} {} rays/px {} tris",
+                    self.trace_settings.max_depth, rays, tris
+                )
+            }
+            LightingPath::Cpu => {
+                let (cols, rows) = self
+                    .cpu_tracer
+                    .as_ref()
+                    .map(|t| t.ray_resolution(self.grid_cols * SUBSAMPLE, self.grid_rows * SUBSAMPLE))
+                    .unwrap_or((0, 0));
+                format!(
+                    "CPU d{} {} rays/px {}x{} {} obj",
+                    self.trace_settings.max_depth,
+                    rays,
+                    cols,
+                    rows,
+                    self.cpu_scene.objects.len()
+                )
+            }
+        }
     }
 
     /// Route keyboard input to the menu and console, and apply what they report.
@@ -1298,6 +1405,13 @@ impl AppState {
                     "gpu: {}",
                     self.graphics.ray_tracing().describe()
                 ));
+                if let Some(t) = self.cpu_tracer.as_ref() {
+                    self.console.print(format!(
+                        "cpu tracer: {} rays last frame, {} analytic objects",
+                        t.rays_cast(),
+                        self.cpu_scene.objects.len()
+                    ));
+                }
                 if let Some(rt) = self.ray_tracer.as_ref() {
                     self.console.print(format!(
                         "as: {} instances, {} tris, {} blas builds, {} tlas builds",
@@ -1306,14 +1420,16 @@ impl AppState {
                         rt.blas_builds(),
                         rt.tlas_builds()
                     ));
-                    self.console.print(format!(
-                        "settings: depth {} shadow x{} ao x{} radius {:.2}",
-                        self.trace_settings.max_depth,
-                        self.trace_settings.shadow_samples,
-                        self.trace_settings.ao_samples,
-                        self.trace_settings.light_radius,
-                    ));
                 }
+                // Outside both branches: the settings drive whichever tracer is
+                // live, so they must be reportable on either path.
+                self.console.print(format!(
+                    "settings: depth {} shadow x{} ao x{} radius {:.2}",
+                    self.trace_settings.max_depth,
+                    self.trace_settings.shadow_samples,
+                    self.trace_settings.ao_samples,
+                    self.trace_settings.light_radius,
+                ));
             }
             // Per-feature switches, so a suspicious image can be attributed to one
             // kind of ray instead of to "the tracer".

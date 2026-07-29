@@ -29,9 +29,10 @@ use std::path::Path;
 use crate::engine::core::{json, EngineError, Result};
 use crate::engine::math::{radians, Transform, Vec3, Vec4};
 use crate::renderer::LightUniform;
+use crate::engine::geometry::Shape;
 use crate::scene::{
-    plane, sphere, Camera, Entity, Hierarchy, MaterialComponent, MeshComponent, Projection, Scene,
-    TransformComponent,
+    plane, plane_shape, sphere, sphere_shape, Camera, ColliderComponent, Entity, Hierarchy,
+    MaterialComponent, MeshComponent, Projection, Scene, TransformComponent,
 };
 
 /// Everything a scene file describes: the entities, the camera to view them
@@ -185,7 +186,7 @@ fn add_entity(
     let mesh_value = value
         .get("mesh")
         .ok_or_else(|| err("entity: missing required \"mesh\" object"))?;
-    let mesh = parse_mesh(mesh_value)?;
+    let (mesh, shape) = parse_mesh(mesh_value)?;
 
     let material = match value.get("material") {
         Some(m) => parse_material(m)?,
@@ -199,6 +200,7 @@ fn add_entity(
 
     let entity = scene.create_entity();
     scene.add_component(entity, mesh);
+    scene.add_component(entity, ColliderComponent::new(shape));
     scene.add_component(entity, material);
     scene.add_component(entity, TransformComponent { local: transform });
 
@@ -218,7 +220,13 @@ fn add_entity(
     Ok(())
 }
 
-fn parse_mesh(value: &json::JsonValue) -> Result<MeshComponent> {
+/// Parse a mesh and, alongside it, the analytic shape it approximates.
+///
+/// The two are produced together on purpose: the exact radius or size is right
+/// here in the scene file, and recovering it from the generated triangles later
+/// would bake the tessellation error into every consumer (the CPU tracer and the
+/// physics collider both need the equation, not the approximation).
+fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
     let kind = value
         .get_str("type")
         .ok_or_else(|| err("mesh: missing \"type\" (\"plane\" or \"sphere\")"))?;
@@ -232,7 +240,7 @@ fn parse_mesh(value: &json::JsonValue) -> Result<MeshComponent> {
             if size <= 0.0 {
                 return Err(err("plane mesh: \"size\" must be positive"));
             }
-            Ok(plane(center, size, color))
+            Ok((plane(center, size, color), plane_shape(size)))
         }
         "sphere" => {
             let radius = value.get_f32("radius").unwrap_or(1.0);
@@ -241,7 +249,10 @@ fn parse_mesh(value: &json::JsonValue) -> Result<MeshComponent> {
             }
             let rings = value.get_u32("rings").unwrap_or(16);
             let segments = value.get_u32("segments").unwrap_or(24);
-            Ok(sphere(center, radius, color, rings, segments))
+            Ok((
+                sphere(center, radius, color, rings, segments),
+                sphere_shape(radius),
+            ))
         }
         other => Err(err(format!(
             "mesh: unknown type {other:?} (expected \"plane\" or \"sphere\")"
