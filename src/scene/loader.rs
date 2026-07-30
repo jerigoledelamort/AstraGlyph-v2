@@ -44,6 +44,13 @@ pub struct LoadedScene {
     pub camera: Camera,
     pub lights: Vec<LightUniform>,
     pub hierarchy: Hierarchy,
+    /// How each entity's mesh was specified, by entity id.
+    ///
+    /// Carried through the load because a `MeshComponent` is a triangle soup: that it
+    /// *was* a sphere of radius 1 with 24 rings is not recoverable from its vertices,
+    /// and an editor saving the scene back would otherwise have to guess. See
+    /// `scene::writer::MeshSource`.
+    pub mesh_sources: std::collections::HashMap<u64, crate::scene::MeshSource>,
 }
 
 fn err(msg: impl Into<String>) -> EngineError {
@@ -72,14 +79,22 @@ pub fn parse_scene(source: &str) -> Result<LoadedScene> {
 
     let mut scene = Scene::new();
     let mut hierarchy = Hierarchy::new();
+    let mut mesh_sources = std::collections::HashMap::new();
     if let Some(entries) = root.get_array("entities") {
         for (i, entry) in entries.iter().enumerate() {
-            add_entity(&mut scene, &mut hierarchy, entry, None)
+            add_entity(&mut scene, &mut hierarchy, &mut mesh_sources, entry, None)
                 .map_err(|e| err(format!("scene: entities[{i}]: {e}")))?;
         }
     }
 
-    Ok(LoadedScene { name, scene, camera, lights, hierarchy })
+    Ok(LoadedScene {
+        name,
+        scene,
+        camera,
+        lights,
+        hierarchy,
+        mesh_sources,
+    })
 }
 
 /// Read and parse a scene file from disk.
@@ -180,13 +195,14 @@ fn parse_light(value: &json::JsonValue) -> Result<LightUniform> {
 fn add_entity(
     scene: &mut Scene,
     hierarchy: &mut Hierarchy,
+    mesh_sources: &mut std::collections::HashMap<u64, crate::scene::MeshSource>,
     value: &json::JsonValue,
     parent: Option<Entity>,
 ) -> Result<()> {
     let mesh_value = value
         .get("mesh")
         .ok_or_else(|| err("entity: missing required \"mesh\" object"))?;
-    let (mesh, shape) = parse_mesh(mesh_value)?;
+    let (mesh, shape, mesh_source) = parse_mesh(mesh_value)?;
 
     let material = match value.get("material") {
         Some(m) => parse_material(m)?,
@@ -201,6 +217,7 @@ fn add_entity(
     let entity = scene.create_entity();
     scene.add_component(entity, mesh);
     scene.add_component(entity, ColliderComponent::new(shape));
+    mesh_sources.insert(entity.id(), mesh_source);
     scene.add_component(entity, material);
     scene.add_component(entity, TransformComponent { local: transform });
 
@@ -212,7 +229,7 @@ fn add_entity(
 
     if let Some(children) = value.get_array("children") {
         for (i, child) in children.iter().enumerate() {
-            add_entity(scene, hierarchy, child, Some(entity))
+            add_entity(scene, hierarchy, mesh_sources, child, Some(entity))
                 .map_err(|e| err(format!("children[{i}]: {e}")))?;
         }
     }
@@ -226,7 +243,9 @@ fn add_entity(
 /// here in the scene file, and recovering it from the generated triangles later
 /// would bake the tessellation error into every consumer (the CPU tracer and the
 /// physics collider both need the equation, not the approximation).
-fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
+fn parse_mesh(
+    value: &json::JsonValue,
+) -> Result<(MeshComponent, Shape, crate::scene::MeshSource)> {
     let kind = value
         .get_str("type")
         .ok_or_else(|| err("mesh: missing \"type\" (\"plane\", \"sphere\" or \"obj\")"))?;
@@ -240,7 +259,11 @@ fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
             if size <= 0.0 {
                 return Err(err("plane mesh: \"size\" must be positive"));
             }
-            Ok((plane(center, size, color), plane_shape(size)))
+            Ok((
+                plane(center, size, color),
+                plane_shape(size),
+                crate::scene::MeshSource::Plane { size },
+            ))
         }
         // An external model. Resolved relative to the working directory first, then
         // the crate root — the same order the scene file itself is found, so a scene
@@ -296,7 +319,13 @@ fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
                 .map(|v| v.position.length())
                 .fold(0.0f32, f32::max)
                 .max(0.001);
-            Ok((mesh, crate::engine::geometry::Shape::Sphere { radius }))
+            Ok((
+                mesh,
+                crate::engine::geometry::Shape::Sphere { radius },
+                crate::scene::MeshSource::Obj {
+                    path: file.to_string(),
+                },
+            ))
         }
         "sphere" => {
             let radius = value.get_f32("radius").unwrap_or(1.0);
@@ -308,6 +337,11 @@ fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
             Ok((
                 sphere(center, radius, color, rings, segments),
                 sphere_shape(radius),
+                crate::scene::MeshSource::Sphere {
+                    radius,
+                    rings,
+                    segments,
+                },
             ))
         }
         other => Err(err(format!(

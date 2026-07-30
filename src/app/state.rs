@@ -22,6 +22,7 @@ use crate::audio::{AudioBuffer, AudioDevice, Listener, Mixer, Spatial, Voice};
 use crate::demo::material_spheres;
 use crate::physics::{ray_through_grid_cell, BodyId, PhysicsWorld, RigidBody};
 use crate::scripting::{EngineState, ScriptCommand, ScriptHost};
+use crate::ui::editor::{Editor, EditorAction, EditorInput, EntityRow};
 use crate::ui::{Console, ConsoleAction, Menu, MenuAction, MenuEvent, MenuItem};
 
 use super::input::InputState;
@@ -279,7 +280,13 @@ fn script_paths() -> Vec<std::path::PathBuf> {
 /// if the file is missing or malformed. The fallback keeps the engine runnable
 /// while a scene file is being edited; which path was taken is logged so a
 /// silent fallback can't be mistaken for a successful load.
-fn load_startup_scene() -> (Scene, Camera, Vec<LightUniform>, Hierarchy) {
+fn load_startup_scene() -> (
+    Scene,
+    Camera,
+    Vec<LightUniform>,
+    Hierarchy,
+    std::collections::HashMap<u64, crate::scene::MeshSource>,
+) {
     let candidates = scene_paths();
 
     for path in &candidates {
@@ -294,7 +301,13 @@ fn load_startup_scene() -> (Scene, Camera, Vec<LightUniform>, Hierarchy) {
                     path.display(),
                     loaded.lights.len()
                 );
-                return (loaded.scene, loaded.camera, loaded.lights, loaded.hierarchy);
+                return (
+                    loaded.scene,
+                    loaded.camera,
+                    loaded.lights,
+                    loaded.hierarchy,
+                    loaded.mesh_sources,
+                );
             }
             Err(e) => eprintln!("scene: failed to load {}: {e}", path.display()),
         }
@@ -302,7 +315,15 @@ fn load_startup_scene() -> (Scene, Camera, Vec<LightUniform>, Hierarchy) {
 
     eprintln!("scene: falling back to the built-in material_spheres demo");
     let (scene, camera) = material_spheres::build_scene();
-    (scene, camera, material_spheres::lights(), Hierarchy::new())
+    // The code-built demo has no recorded descriptors; the writer falls back to
+    // inferring them from colliders, which is the editor-created-entity path.
+    (
+        scene,
+        camera,
+        material_spheres::lights(),
+        Hierarchy::new(),
+        std::collections::HashMap::new(),
+    )
 }
 
 /// Main application state.
@@ -335,6 +356,14 @@ pub struct AppState {
     assets: AssetWatcher,
     /// Reloads applied since startup, for the profiler.
     asset_reloads: u64,
+    /// Scene editor overlay (F2). An in-engine panel rather than a second window —
+    /// see `ui::editor` for why.
+    editor: Editor,
+    /// Mesh descriptors by entity id, so a saved scene keeps its sphere tessellation
+    /// and OBJ paths rather than being reverse-engineered from triangles.
+    mesh_sources: std::collections::HashMap<u64, crate::scene::MeshSource>,
+    /// Where the scene came from, so the editor knows where to save it back.
+    scene_path: Option<std::path::PathBuf>,
     /// Real per-pass GPU timings from timestamp queries, replacing the wall-clock
     /// estimate `FrameMetrics` has always reported. Disabled on adapters without
     /// `TIMESTAMP_QUERY`, in which case it says so rather than reporting zeros.
@@ -468,6 +497,15 @@ struct UiKeyLatches {
     end: bool,
     page_up: bool,
     page_down: bool,
+    editor_toggle: bool,
+    editor_gizmo: bool,
+    editor_axis: bool,
+    editor_minus: bool,
+    editor_equal: bool,
+    editor_finer: bool,
+    editor_coarser: bool,
+    editor_dup: bool,
+    editor_save: bool,
 }
 
 /// Edge detector: true only on the frame a key transitions to pressed.
@@ -530,7 +568,7 @@ impl AppState {
             sub_rows,
         );
 
-        let (scene, camera, lights, hierarchy) = load_startup_scene();
+        let (scene, camera, lights, hierarchy, mesh_sources) = load_startup_scene();
 
         let camera_rig = seed_rig_from_camera(&camera);
 
@@ -616,6 +654,9 @@ impl AppState {
             elapsed: 0.0,
             assets,
             asset_reloads: 0,
+            editor: Editor::new(),
+            mesh_sources,
+            scene_path: scene_paths().into_iter().find(|p| p.exists()),
             gpu_timer,
             profiler_visible: false,
             profiler_key_was_down: false,
@@ -708,13 +749,26 @@ impl AppState {
 
     /// Whether any UI layer holds keyboard focus, in which case the camera must
     /// not react to movement keys.
+    ///
+    /// The editor counts: its keys overlap the camera's (G, V, D) and the movement
+    /// keys, so leaving the camera live would move both at once.
     fn ui_has_focus(&self) -> bool {
-        self.console.is_open() || self.menu.is_open()
+        self.console.is_open() || self.menu.is_open() || self.editor.is_open()
     }
 
     /// Handle Escape. Returns true if a UI layer consumed it, in which case the
     /// application must NOT exit.
     pub fn handle_escape(&mut self) -> bool {
+        if self.editor.is_open() {
+            // Escape deselects first, then closes: losing a selection is cheaper to
+            // undo than losing the whole editor state.
+            if self.editor.selected().is_some() {
+                self.editor.handle(EditorInput::Deselect, 0);
+            } else {
+                self.editor.close();
+            }
+            return true;
+        }
         if self.console.is_open() {
             self.console.close();
             self.input.clear_typed();
@@ -1200,7 +1254,7 @@ impl AppState {
         // The overlay is redrawn from scratch each frame: HUD first, then the
         // menu or console on top of it so a panel covers the stats rather than
         // fighting them for the same cells.
-        let ui_open = self.menu.is_open() || self.console.is_open();
+        let ui_open = self.menu.is_open() || self.console.is_open() || self.editor.is_open();
         if self.hud_visible || self.profiler_visible || ui_open {
             self.overlay.clear();
             if self.hud_visible {
@@ -1208,6 +1262,10 @@ impl AppState {
             }
             if self.profiler_visible {
                 self.draw_profiler();
+            }
+            if self.editor.is_open() {
+                let rows = self.entity_rows();
+                self.editor.draw(&mut self.overlay, &rows);
             }
             self.menu.draw(&mut self.overlay);
             self.console.draw(&mut self.overlay);
@@ -1274,6 +1332,231 @@ impl AppState {
         self.metrics.fps()
     }
 
+    /// Entities the editor can act on: everything with a mesh, in creation order.
+    ///
+    /// Rebuilt each call rather than cached, because the editor's selection is an
+    /// index into it and a stale cache would point at the wrong entity after a
+    /// duplicate or a delete.
+    fn editable_entities(&self) -> Vec<Entity> {
+        self.scene.entities_with::<MeshComponent>()
+    }
+
+    /// One row of the editor's list, including where the entity is on screen.
+    fn entity_rows(&self) -> Vec<EntityRow> {
+        let entities = self.editable_entities();
+        let view_projection = self.camera.view_projection();
+        entities
+            .iter()
+            .map(|entity| {
+                let transform = self.scene.get_component::<TransformComponent>(*entity);
+                let position = transform.map(|t| t.local.position).unwrap_or(Vec3::ZERO);
+                let scale = transform.map(|t| t.local.scale.x).unwrap_or(1.0);
+                let material = self
+                    .scene
+                    .get_component::<MaterialComponent>(*entity)
+                    .map(|m| {
+                        if m.material_type == crate::scene::MaterialType::Mirror as u32 {
+                            "mirror"
+                        } else if m.material_type == crate::scene::MaterialType::Glass as u32 {
+                            "glass"
+                        } else {
+                            "matte"
+                        }
+                    })
+                    .unwrap_or("none");
+                // World position, since a child's local position is relative to its
+                // parent and would project to the wrong place.
+                let world = self
+                    .hierarchy
+                    .world_matrices(&[*entity], &|e: Entity| {
+                        self.scene
+                            .get_component::<TransformComponent>(e)
+                            .map(|t| t.world_matrix())
+                            .unwrap_or(Mat4::IDENTITY)
+                    })
+                    .into_iter()
+                    .find(|(e, _)| *e == *entity)
+                    .map(|(_, m)| m.transform_point(Vec3::ZERO))
+                    .unwrap_or(position);
+                EntityRow {
+                    id: entity.id(),
+                    label: format!("{material} s{scale:.2}"),
+                    position,
+                    scale,
+                    material: material.to_string(),
+                    screen: self.project_to_grid(world, &view_projection),
+                }
+            })
+            .collect()
+    }
+
+    /// Project a world position onto the glyph grid, or `None` if it is off screen
+    /// or behind the camera.
+    fn project_to_grid(&self, world: Vec3, view_projection: &Mat4) -> Option<(u32, u32)> {
+        let clip = view_projection
+            .transform_vec4(crate::engine::math::Vec4::from_vec3(world, 1.0));
+        // Behind the camera: `w <= 0` means the point is on the wrong side of the
+        // eye, and dividing would fold it back onto the screen at a mirrored
+        // position — an entity behind you appearing in front of you.
+        if clip.w <= 1e-6 {
+            return None;
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        if !(-1.0..=1.0).contains(&ndc_x) || !(-1.0..=1.0).contains(&ndc_y) {
+            return None;
+        }
+        // NDC y is up, grid rows go down.
+        let col = ((ndc_x * 0.5 + 0.5) * self.grid_cols as f32) as u32;
+        let row = ((1.0 - (ndc_y * 0.5 + 0.5)) * self.grid_rows as f32) as u32;
+        Some((col.min(self.grid_cols - 1), row.min(self.grid_rows - 1)))
+    }
+
+    /// Apply what the editor asked for.
+    fn apply_editor_action(&mut self, action: EditorAction) {
+        let entities = self.editable_entities();
+        let selected = self.editor.selected().and_then(|i| entities.get(i)).copied();
+
+        match action {
+            EditorAction::Translate(delta) => {
+                if let Some(entity) = selected {
+                    if let Some(t) = self.scene.get_component_mut::<TransformComponent>(entity) {
+                        t.local.position = t.local.position + delta;
+                    }
+                    self.after_scene_edit();
+                }
+            }
+            EditorAction::Rotate(delta) => {
+                if let Some(entity) = selected {
+                    if let Some(t) = self.scene.get_component_mut::<TransformComponent>(entity) {
+                        t.local.rotation = t.local.rotation + delta;
+                    }
+                    self.after_scene_edit();
+                }
+            }
+            EditorAction::ScaleBy(factor) => {
+                if let Some(entity) = selected {
+                    if let Some(t) = self.scene.get_component_mut::<TransformComponent>(entity) {
+                        // Clamped: a scale of zero collapses the mesh to a point and
+                        // makes its collider degenerate, and there is no way back
+                        // from it by multiplying.
+                        t.local.scale = Vec3::splat(
+                            (t.local.scale.x * factor).clamp(0.001, 1000.0),
+                        );
+                    }
+                    self.after_scene_edit();
+                }
+            }
+            EditorAction::Duplicate => {
+                if let Some(entity) = selected {
+                    self.duplicate_entity(entity);
+                }
+            }
+            EditorAction::Delete => {
+                if let Some(entity) = selected {
+                    self.scene.destroy_entity(entity);
+                    // The selection was an index into a list that just shrank.
+                    let count = self.editable_entities().len();
+                    self.editor.select(self.editor.selected(), count);
+                    self.editor.set_message(format!("deleted entity {}", entity.id()));
+                    self.after_scene_edit();
+                }
+            }
+            EditorAction::Save => self.save_scene(),
+        }
+    }
+
+    /// Copy an entity, offset so the copy is visible rather than hidden inside the
+    /// original.
+    fn duplicate_entity(&mut self, source: Entity) {
+        let mesh = self.scene.get_component::<MeshComponent>(source).cloned();
+        let material = self.scene.get_component::<MaterialComponent>(source).copied();
+        let collider = self.scene.get_component::<ColliderComponent>(source).copied();
+        let transform = self
+            .scene
+            .get_component::<TransformComponent>(source)
+            .cloned();
+        let source_mesh = self.mesh_sources.get(&source.id()).cloned();
+
+        let Some(mesh) = mesh else {
+            self.editor.set_message("cannot duplicate: no mesh".to_string());
+            return;
+        };
+        let copy = self.scene.create_entity();
+        self.scene.add_component(copy, mesh);
+        if let Some(material) = material {
+            self.scene.add_component(copy, material);
+        }
+        if let Some(collider) = collider {
+            self.scene.add_component(copy, collider);
+        }
+        if let Some(mut transform) = transform {
+            // Offset along the editor's current axis by one step, so the copy lands
+            // somewhere the author can see and immediately move.
+            let offset = self.editor.axis().unit() * self.editor.step_size().max(0.5);
+            transform.local.position = transform.local.position + offset;
+            self.scene.add_component(copy, transform);
+        }
+        if let Some(source_mesh) = source_mesh {
+            self.mesh_sources.insert(copy.id(), source_mesh);
+        }
+        // Select the copy: duplicating in order to then move the original is not
+        // what anyone means by it.
+        let count = self.editable_entities().len();
+        self.editor.select(Some(count.saturating_sub(1)), count);
+        self.editor
+            .set_message(format!("duplicated as entity {}", copy.id()));
+        self.after_scene_edit();
+    }
+
+    /// Rebuild what a scene edit invalidated.
+    ///
+    /// The ray tracer caches geometry per entity id and physics holds entity handles,
+    /// so both go stale the moment an entity is added or removed. Rebuilding the
+    /// tracer on every *nudge* would be wasteful, but a nudge does not change the
+    /// instance set — only the transforms, which the TLAS picks up itself.
+    fn after_scene_edit(&mut self) {
+        if self.physics_enabled {
+            self.build_physics();
+        }
+    }
+
+    /// Write the scene back to the file it came from.
+    fn save_scene(&mut self) {
+        let Some(path) = self.scene_path.clone() else {
+            self.editor
+                .set_message("no scene file to save to".to_string());
+            return;
+        };
+        let document = crate::scene::SceneDocument {
+            name: "material_spheres",
+            scene: &self.scene,
+            camera: &self.camera,
+            lights: &self.lights,
+            hierarchy: &self.hierarchy,
+            mesh_sources: &self.mesh_sources,
+        };
+        match crate::scene::writer::save(&path, &document) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.editor.set_message(format!("saved {name}"));
+                self.console.print(format!("[editor] saved {name}"));
+                eprintln!("editor: saved {}", path.display());
+                // The watcher will see our own write and reload it. Harmless — the
+                // file matches what is in memory — but it would print a confusing
+                // "reloaded" line, so the fingerprint is refreshed first.
+                self.assets.poll_now(std::time::Instant::now());
+            }
+            Err(e) => {
+                self.editor.set_message(format!("save failed: {e}"));
+                self.console.print_error(format!("[editor] save failed: {e}"));
+            }
+        }
+    }
+
     /// Reload any asset whose contents changed on disk.
     ///
     /// Rate-limited inside the watcher (250 ms), so this costs one `is_due` check on
@@ -1337,6 +1620,7 @@ impl AppState {
         self.scene = loaded.scene;
         self.hierarchy = loaded.hierarchy;
         self.lights = loaded.lights;
+        self.mesh_sources = loaded.mesh_sources;
         self.camera_rig = seed_rig_from_camera(&loaded.camera);
         // The projection comes from the file, but the aspect ratio comes from the
         // window — so it is preserved rather than reset to whatever the file said.
@@ -2028,11 +2312,30 @@ impl AppState {
         ]
         .map(|code| self.input.is_key_pressed(code));
 
+        // F2 toggles the editor. Checked before the menu, since Tab means "next
+        // entity" while the editor is open and "open the menu" otherwise.
+        let editor_toggle = pressed_once(
+            self.input.is_key_pressed(KeyCode::F2),
+            &mut self.ui_keys_down.editor_toggle,
+        );
+        if editor_toggle {
+            self.editor.toggle();
+            if self.editor.is_open() {
+                self.menu.close();
+                self.console.close();
+                self.editor
+                    .set_message("F2 closes  ESC deselects".to_string());
+            }
+        }
+
         // Tab opens/closes the menu; Backquote the console. They are mutually
         // exclusive so focus is never ambiguous.
         let toggle_menu = pressed_once(raw[0], &mut self.ui_keys_down.menu_toggle);
         let toggle_console = pressed_once(raw[1], &mut self.ui_keys_down.console_toggle);
 
+        // While the editor is open it owns Tab, so the menu toggle must not also
+        // fire — otherwise one press would both pick an entity and open the menu.
+        let toggle_menu = toggle_menu && !self.editor.is_open();
         if toggle_menu {
             if self.menu.is_open() {
                 self.menu.close();
@@ -2097,6 +2400,64 @@ impl AppState {
             }
             if page_down {
                 self.console.scroll_down(4);
+            }
+            return;
+        }
+
+        if self.editor.is_open() {
+            self.input.clear_typed();
+            let shift = self.input.is_key_pressed(KeyCode::ShiftLeft)
+                || self.input.is_key_pressed(KeyCode::ShiftRight);
+            let control = self.input.is_key_pressed(KeyCode::ControlLeft)
+                || self.input.is_key_pressed(KeyCode::ControlRight);
+
+            // One snapshot, then edge-detect each key, so a held key acts once.
+            let editor_raw = [
+                KeyCode::KeyG,
+                KeyCode::KeyV,
+                KeyCode::Minus,
+                KeyCode::Equal,
+                KeyCode::BracketLeft,
+                KeyCode::BracketRight,
+                KeyCode::KeyD,
+                KeyCode::KeyS,
+            ]
+            .map(|code| self.input.is_key_pressed(code));
+            let gizmo = pressed_once(editor_raw[0], &mut self.ui_keys_down.editor_gizmo);
+            let axis = pressed_once(editor_raw[1], &mut self.ui_keys_down.editor_axis);
+            let nudge_down = pressed_once(editor_raw[2], &mut self.ui_keys_down.editor_minus);
+            let nudge_up = pressed_once(editor_raw[3], &mut self.ui_keys_down.editor_equal);
+            let finer = pressed_once(editor_raw[4], &mut self.ui_keys_down.editor_finer);
+            let coarser = pressed_once(editor_raw[5], &mut self.ui_keys_down.editor_coarser);
+            let duplicate = pressed_once(editor_raw[6], &mut self.ui_keys_down.editor_dup);
+            let save = pressed_once(editor_raw[7], &mut self.ui_keys_down.editor_save);
+
+            let count = self.editable_entities().len();
+            let inputs = [
+                // Shift-Tab steps backwards, which is the universal convention.
+                (raw[0] && shift, EditorInput::SelectPrevious),
+                (raw[0] && !shift, EditorInput::SelectNext),
+                (gizmo, EditorInput::CycleGizmo),
+                (axis, EditorInput::CycleAxis),
+                (nudge_up, EditorInput::Nudge(true)),
+                (nudge_down, EditorInput::Nudge(false)),
+                (finer, EditorInput::FinerStep),
+                (coarser, EditorInput::CoarserStep),
+                (duplicate, EditorInput::Duplicate),
+                (delete, EditorInput::Delete),
+                // Ctrl-S rather than S alone: S is a movement key everywhere else,
+                // and a stray save would overwrite the scene file.
+                (save && control, EditorInput::Save),
+            ];
+            // Tab was consumed by the editor, so the menu latch must be updated
+            // without the menu acting on it.
+            for (fired, input) in inputs {
+                if !fired {
+                    continue;
+                }
+                if let Some(action) = self.editor.handle(input, count) {
+                    self.apply_editor_action(action);
+                }
             }
             return;
         }
@@ -2264,6 +2625,8 @@ impl AppState {
                 self.console.print("  reload            reload watched scripts");
                 self.console.print("  perf              frame timing breakdown");
                 self.console.print("  assets            watched files, force a reload");
+                self.console.print("  editor [on|off]    scene editor overlay (F2)");
+                self.console.print("  save              write the scene to disk");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -2525,6 +2888,20 @@ impl AppState {
                         .print(format!("reload: {reloaded} file(s) changed")),
                 }
             }
+            "editor" => {
+                let on = on_off(arg, self.editor.is_open());
+                if on {
+                    self.editor.open();
+                } else {
+                    self.editor.close();
+                }
+                self.console.print(format!(
+                    "editor: {} ({} editable entities)",
+                    if on { "on" } else { "off" },
+                    self.editable_entities().len()
+                ));
+            }
+            "save" => self.save_scene(),
             "assets" => {
                 let events = self.assets.poll_now(std::time::Instant::now());
                 self.console.print(format!(

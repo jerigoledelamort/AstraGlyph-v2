@@ -6,6 +6,7 @@
 // behaviour unit-testable and the bindings replaceable.
 
 pub mod console;
+pub mod editor;
 pub mod menu;
 
 #[allow(unused_imports)]

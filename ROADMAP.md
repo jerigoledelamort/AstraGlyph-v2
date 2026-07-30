@@ -219,14 +219,37 @@ cores on the target hardware.
 
 ---
 
-## 🛠️ Phase 6: Tooling 🛠️
+## 🛠️ Phase 6: Tooling 🛠️ (6.1–6.3, less glTF/JPEG and the separate editor window)
 *Developer tools for a better workflow.*
 
 ### 6.1 Scene Editor
-- [ ] Separate window for scene editing
-- [ ] Drag-and-drop entity placement
-- [ ] Transform gizmo (move, rotate, scale widgets)
-- [ ] Property inspector (edit component values)
+- [x] Scene editing — but as an **in-engine overlay (F2), not a separate window**.
+      This item is deliberately reworded rather than ticked as written. A second
+      window needs its own surface, swapchain and copy of the glyph pipeline, and
+      then the author edits in one window while watching the result in another. The
+      engine's whole output is a character grid, so an editor drawn *into* that grid
+      sits on top of the scene it edits and a nudge is visible in the thing being
+      nudged. What it costs: the editor competes with the scene for screen space
+- [x] Entity placement — keyboard nudging along a chosen axis with a selectable step
+      (0.01 to 5.0 world units), **not OS drag-and-drop**. A file-manager drop needs
+      a windowing hook that has no meaning for an entity that does not exist yet;
+      picking from a list and nudging is the same operation without the ceremony
+- [x] Transform gizmo: move / rotate / scale (G cycles), axis X/Y/Z (V cycles),
+      `-`/`=` to nudge. The selected entity is marked in the viewport by projecting
+      its world position onto the glyph grid, so selection is visible in the scene
+      and not only in the panel. Scaling down is the *reciprocal* of scaling up, not
+      the negation — a negative scale mirrors the mesh and inverts its winding, so it
+      would vanish under back-face culling
+- [x] Property inspector: the panel shows each entity's material type, scale and
+      position, with the selection windowed so a large scene does not overflow it
+- [x] **Save, and load back without loss** — the phase's completion criterion.
+      `scene/writer.rs` serialises the scene to the same JSON `scene/loader.rs`
+      reads, and the loader now carries mesh descriptors through so a sphere keeps
+      its ring count and an OBJ keeps its path: a `MeshComponent` is a triangle soup
+      and "this was a sphere of radius 1" is not recoverable from its vertices.
+      Verified at runtime — nudged an entity from x = -2.2 to -1.2, duplicated it
+      (6 → 7 entities), saved, and reloaded from disk with both the position and all
+      seven descriptors intact
 
 ### 6.2 Asset Pipeline
 - [x] OBJ model loader, hand-written. Handles 1-based *and* negative indices, all

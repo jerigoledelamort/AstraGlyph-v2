@@ -12,6 +12,7 @@ pub mod loader;
 pub mod material_registry;
 pub mod primitives;
 pub mod scene;
+pub mod writer;
 
 pub use camera::{Camera, Projection};
 pub use camera_rig::{CameraMode, CameraRig};
@@ -35,3 +36,5 @@ pub use entity::Entity;
 // collider would sit at the origin rather than at the wall.
 pub use primitives::{plane, plane_shape, sphere, sphere_shape};
 pub use scene::Scene;
+#[allow(unused_imports)]
+pub use writer::{MeshSource, SceneDocument};
