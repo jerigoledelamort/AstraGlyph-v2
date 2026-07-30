@@ -31,48 +31,117 @@ cargo test
 
 ## 🎮 Управление
 
-| Ввод | Действие |
-|---|---|
-| **W / A / S / D** | Вперёд, влево, назад, вправо |
-| **Пробел** | Вверх |
-| **Левый Ctrl** | Вниз |
-| **Мышь (ЛКМ зажата)** | Осмотр (pitch + yaw) |
-| **Escape** | Выход |
+### Камера
 
-Скорость движения: 300 юнитов/сек. Чувствительность мыши: 0.0025 рад/пиксель.
+| Клавиши | Действие |
+|---|---|
+| **W / A / S / D** | Движение вперёд, влево, назад, вправо |
+| **Left Shift / Left Ctrl** | Вверх / вниз |
+| **Мышь (ЛКМ зажата)** | Обзор |
+| **Колесо** | Зум — дистанция рига или FOV в первом лице |
+| **C** | Пресет камеры (first person / third person / orbit) |
+
+### Рендер
+
+| Клавиши | Действие |
+|---|---|
+| **R** | Растеризация ↔ трассировка лучей. Строка `LIGHT` в HUD показывает активный путь |
+| **B** | Квадрантные блоки ↔ градиентная рампа |
+| **M** | Цветовой режим (TrueColor / 256 / 16 / grayscale / mono) |
+| **P** | Пост-обработка (bloom, SSAO, гамма, хроматическая аберрация) |
+| **G** | Динамическая сетка — далёкие плоские по глубине области сливаются в крупные глифы |
+
+### Симуляция и скриптинг
+
+| Клавиши | Действие |
+|---|---|
+| **F** | Физика твёрдых тел |
+| **X** | Луч через перекрестье: сообщает дистанцию и line of sight |
+| **L** | Запуск `assets/scripts/demo.lua` — правь на ходу, файл перезагрузится |
+| **Space** | Процедурный звук в точке перекрестья |
+| **O** | Зацикленный источник, вращающийся вокруг слушателя — слышно 3D-панорамирование |
+
+### Инструменты и UI
+
+| Клавиши | Действие |
+|---|---|
+| **H** | HUD |
+| **F3** | Профайлер: разбивка кадра, GPU-время по проходам, draw calls, память |
+| **F2** | Редактор сцены. Tab выбирает сущность, **G** — move/rotate/scale, **V** — ось, `-`/`=` — сдвиг, `[`/`]` — шаг, **D** — дублировать, **Delete** — удалить, **Ctrl-S** — сохранить |
+| **Tab** | Меню настроек (когда редактор закрыт) |
+| **`** | Консоль — `help` перечисляет все команды |
+| **Escape** | Закрыть открытую панель или выйти |
+
+Диагностика: `ASTRAGLYPH_INPUT_TRACE=1` логирует события ввода,
+`ASTRAGLYPH_NO_RAYTRACING=1` принудительно включает CPU-трассировщик на железе,
+которое поддерживает ray query.
 
 ## 🏗️ Архитектура
 
 ```
 src/
-├── main.rs                  ← Точка входа, winit event loop (ApplicationHandler)
-├── app/                     ← Состояние приложения и обработка ввода
-│   ├── state.rs             ← AppState, CameraController, render loop
-│   └── input.rs             ← InputState (отслеживание клавиш/мыши, тесты)
+├── main.rs                  ← Entry point, winit event loop (ApplicationHandler)
+├── app/
+│   ├── state.rs             ← AppState: ties every subsystem to the frame loop
+│   ├── input.rs             ← InputState (key/mouse tracking)
+│   └── metrics.rs           ← FPS, CPU and submit timing
 ├── engine/
-│   ├── core/                ← EngineError, block_on (async→sync), Pod trait
-│   ├── math/                ← Vec2, Vec3, Vec4, Mat4, Transform (все с тестами)
-│   └── platform/            ← winit 0.30 EventLoop + создание окна
-├── graphics/                ← Абстракции wgpu
-│   ├── device.rs            ← Instance, Adapter, Surface, Device
-│   ├── buffer.rs            ← Утилиты буферов
-│   ├── pipeline.rs          ← Компиляция шейдеров, сборка рендер-пайплайна
-│   ├── texture.rs           ← Целевые текстуры, загрузка текстур
-│   └── shaders/             ← WGSL-шейдеры (сцена + композит)
-├── renderer/                ← Рендер-проходы
-│   ├── scene_pass.rs        ← 3D-сцена → offscreen-текстура (120×68)
-│   ├── ascii_pass.rs        ← GPU readback → ASCII-глифы (quads)
-│   └── composite_pass.rs    ← Атлас глифов → поверхность экрана
-├── ascii/                   ← Системы, связанные с ASCII
-│   ├── glyph_atlas.rs       ← Процедурные 8×8 bitmap-глифы (14 символов)
-│   └── cell_grid.rs         ← Динамическая сетка ячеек для рендеринга
-├── scene/                   ← Граф сцены
-│   ├── entity.rs            ← Сущность (handle-based)
-│   ├── component.rs         ← Система компонентов (хранение по TypeId)
-│   ├── scene.rs             ← Контейнер сцены (ECS-like)
-│   └── camera.rs            ← Камера + Frustum + Projection
-└── demo/                    ← Демо-сцены
-    └── cornell_box.rs       ← Cornell Box (стены, коробки, освещение)
+│   ├── core/                ← EngineError, block_on, Pod, hand-written JSON parser
+│   ├── math/                ← Vec2/3/4, Mat4, Transform
+│   ├── geometry/            ← Analytic shapes, ray intersection, shape collision.
+│   │                          Shared by the CPU tracer and physics, so a reflection
+│   │                          cannot disagree with a collision
+│   └── platform/            ← winit 0.30 EventLoop + window creation
+├── graphics/                ← wgpu abstractions
+│   ├── device.rs            ← Instance, Adapter, Surface, Device, feature negotiation
+│   ├── capabilities.rs      ← Ray-query detection and the fallback decision
+│   ├── timing.rs            ← QuerySet timestamp queries: real per-pass GPU time
+│   └── shaders/             ← WGSL. scene_shading is shared by both lighting paths
+├── renderer/
+│   ├── scene_pass.rs        ← 3D scene → offscreen texture, rasterised or traced
+│   ├── raytrace.rs          ← BLAS/TLAS, geometry heap, ray budget
+│   ├── cpu_trace.rs         ← Analytic CPU tracer for hardware without ray query
+│   ├── post_process.rs      ← Bloom, SSAO, gamma, chromatic aberration
+│   ├── ascii_pass.rs        ← Subpixels → glyph quads
+│   └── composite_pass.rs    ← Glyph atlas → screen surface
+├── ascii/
+│   ├── glyph_atlas.rs       ← Procedural 8×8 bitmaps
+│   ├── font5x7.rs           ← Hand-coded font for printable ASCII
+│   ├── blocks.rs            ← Quadrant block elements (2× effective resolution)
+│   ├── box_drawing.rs       ← Box-drawing set for UI frames
+│   ├── grid_layout.rs       ← Depth-driven merging of distant cells
+│   ├── color.rs             ← TrueColor / 256 / 16 / greyscale quantisation
+│   └── overlay.rs           ← 2D UI layer composited over the scene
+├── scene/
+│   ├── archetype.rs         ← Archetype component storage (packed columns)
+│   ├── scene.rs             ← Scene container over it; API unchanged by the rewrite
+│   ├── loader.rs            ← Scene files → Scene, via the hand-written JSON parser
+│   ├── writer.rs            ← Scene → scene file, round-trip tested
+│   ├── hierarchy.rs         ← Parent/child with cycle detection and memoisation
+│   ├── frustum.rs           ← Aabb/Plane/Frustum culling
+│   └── camera.rs, camera_rig.rs, primitives.rs, material_registry.rs
+├── physics/
+│   ├── body.rs              ← Rigid bodies, semi-implicit Euler (linear only)
+│   └── world.rs             ← Contact solver, raycasting, line of sight
+├── audio/
+│   ├── wav.rs               ← WAV decoder (PCM 8/16/24/32, float, EXTENSIBLE)
+│   ├── mixer.rs             ← Software mixer: panning, attenuation, Doppler
+│   ├── device.rs            ← winmm waveOut via raw FFI
+│   └── synth.rs             ← Procedural sounds, so the demo needs no audio assets
+├── scripting/               ← Lua, self-implemented
+│   ├── lexer.rs, parser.rs  ← Tokens, then recursive descent with precedence climbing
+│   ├── value.rs             ← Values and tables (array + hash parts)
+│   ├── interp.rs            ← Tree-walking interpreter, bounded steps and depth
+│   ├── stdlib.rs            ← print, type, pairs, math, string, table, __index
+│   └── bindings.rs          ← Engine mailbox + hot-reload
+├── assets/
+│   ├── obj.rs               ← Wavefront OBJ parser
+│   ├── png.rs               ← PNG decoder, including a DEFLATE inflater
+│   └── hot_reload.rs        ← Watches by contents, not timestamps
+├── ui/
+│   ├── menu.rs, console.rs  ← Settings menu and debug console
+│   └── editor.rs            ← Scene editor overlay: select, gizmo, save
+└── demo/                    ← Demo scenes
 ```
 
 ### Пайплайн рендеринга
@@ -80,35 +149,68 @@ src/
 ```
 ┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  3D Сцена (Cornell) │────▶│  Offscreen Tex   │────▶│  ASCII Сетка    │
-│  (120×68 пикселей)  │     │  (Rgba8Unorm)    │     │  (8160 ячеек)   │
+│  (240×136 субпикс.) │     │  (Rgba8Unorm)    │     │  (8160 ячеек)   │
 └─────────────────────┘     └──────────────────┘     └────────┬────────┘
                                                               │
                                                               ▼
 ┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  Поверхность экрана │◀────│  Composite Pass  │◀────│  GPU Readback   │
-│  (1280×720 ASCII)   │     │  (Атлас глифов)  │     │  (CPU sync)     │
+│  (1280×720 ASCII)   │     │  (Атлас глифов)  │     │  (CPU async)    │
 └─────────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
-1. **Scene Pass**: 3D-меши рендерятся в RGBA-текстуру 120×68 с простым освещением (ambient + diffuse).
-2. **GPU Readback**: Текстура копируется в память CPU (синхронно — блокирует кадр).
-3. **ASCII Converter**: Каждый пиксель → индекс яркости → индекс глифа → InstanceData.
-4. **Composite Pass**: InstanceData отправляются на GPU как storage buffer. Vertex shader сопоставляет каждый инстанс с quad, который выбирает нужный глиф из атласа. Fragment shader раскрашивает глиф.
-5. **Экран**: Выход composite pass рендерится на поверхность winit.
+1. **Scene Pass**: меши рендерятся в RGBA-текстуру 240×136 — вдвое больше сетки глифов по
+   каждой оси, так что каждой ячейке достаётся блок 2×2 субпикселя. Освещение либо
+   растеризованное (Phong, shadow map, аналитическое окружение), либо трассированное по
+   ускоряющей структуре GPU; **R** переключает, а третий путь трассирует аналитически на
+   CPU для железа без ray query.
+2. **GPU Readback**: текстура копируется в память CPU двойной буферизацией и без
+   блокировки — может отставать на кадр, но никогда не останавливает CPU в ожидании GPU.
+   (В MVP было синхронно; ровно это и правила Phase 1.2.)
+3. **Пост-обработка** (по желанию, **P**): bloom, SSAO, гамма и хроматическая аберрация
+   работают по субпиксельному буферу *до* выбора глифов, поэтому влияют на то, какой
+   символ получит ячейка, а не только на его цвет.
+4. **ASCII Converter**: каждый блок 2×2 → квадрантный блочный глиф (удваивая эффективное
+   разрешение) или символ градиентной рампы, затем `InstanceData`. Сетка умеет сливать
+   далёкие плоские по глубине области в крупные глифы (**G**).
+5. **Composite Pass**: инстансы уходят на GPU storage-буфером. Вершинный шейдер
+   разворачивает каждый в квад, выбирающий нужный глиф из атласа; фрагментный красит.
+6. **Экран**: композит выводится на surface winit.
 
 ## 🧪 Тестирование
 
-58 юнит-тестов покрывают:
-- **Математика**: Vec2, Vec3, Vec4, Mat4 (сложение, умножение, перспектива, поворот и т.д.)
-- **Ввод**: Нажатие/отпускание клавиш, накопление дельты мыши, состояние кнопок
-- **ASCII**: Размер атласа глифов, отображение яркости, создание сетки ячеек
-- **Сцена**: Создание сущностей, хранение компонентов, удаление, фильтрация
-- **Камера**: View/projection матрицы, векторы вперёд/вправо
+1022 юнит-теста. Каждая архитектурная функция покрыта, как требуют правила проекта, и
+акцент на свойствах, которые ломаются молча, а не на покрытии строк:
+
+- **Математика**: Vec2/3/4, Mat4, `inverse_affine`, композиция Transform
+- **Геометрия**: пересечения луча со сферой/боксом/плоскостью/треугольником, коллизии
+  фигур с нормалями и глубинами контакта, ориентированные боксы через теорему о
+  разделяющей оси
+- **Физика**: энергия не берётся из ниоткуда, покоящееся тело не дрожит, быстрое не
+  проходит сквозь стену, позиционная коррекция делится по обратной массе
+- **Аудио**: декодирование WAV для каждой поддержанной битности, constant-power
+  панорамирование, Doppler только по компоненте скорости вдоль линии визирования,
+  16-битная конверсия без переполнения
+- **Скриптинг**: лексер Lua, приоритеты и ассоциативность парсера, семантика интерпретатора
+  (`%` как в Lua, приведение типов в арифметике но не в сравнении, лексическая область,
+  замыкания с общим состоянием), стандартная библиотека, hot-reload
+- **Ассеты**: OBJ с 1-based *и* отрицательными индексами, дедупликация вершин по тройкам,
+  триангуляция n-угольников; PNG со всеми пятью фильтрами, Adam7 и настоящим
+  zlib-сжатым фикстуром, чтобы путь Huffman'а реально проверялся
+- **Сцена**: archetype-хранение (учёт swap-remove, запросы в порядке создания),
+  round-trip сериализации, разбор JSON
+- **Рендерер**: конверсия трансформа TLAS, бюджеты лучей, раскладка глифов и сетки,
+  квантование цвета, пост-обработка
 
 ```bash
 cargo test
-# 58 тестов, 0 падений
+# 1022 теста, 0 падений
 ```
+
+Зависящее от GPU поведение (вывод шейдеров, сборка ускоряющих структур, readback) юнит-
+тестами не покрыто — в тестовом окружении нет wgpu-устройства. Оно проверяется запуском и
+измерением: разницей пикселей в render target, счётчиками сборок, timestamp queries. Эти
+измерения записаны в сообщениях коммитов.
 
 ## 📚 Технологический стек
 
