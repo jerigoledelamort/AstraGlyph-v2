@@ -1,6 +1,7 @@
 // Scene module: entity, component, scene, camera, primitives, hierarchy,
 // frustum culling, material registry.
 
+pub mod archetype;
 pub mod camera;
 pub mod camera_rig;
 pub mod component;

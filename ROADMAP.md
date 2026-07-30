@@ -155,28 +155,67 @@ cores on the target hardware.
 
 ---
 
-## 🎮 Phase 5: Game Engine Foundations 🎮
+## 🎮 Phase 5: Game Engine Foundations 🎮 (5.1–5.4, less OGG and the scheduler)
 *Graphics engine → general-purpose game engine.*
 
 ### 5.1 Physics
-- [ ] Collision detection (AABB, OBB, sphere)
-- [ ] Rigid body simulation (self-written, no physics library)
-- [ ] Raycasting for gameplay (click-to-move, line of sight)
+- [x] Collision detection: sphere/sphere, sphere/box, sphere/plane, box/box
+      (separating-axis over all 15 axes), box/plane. Every test returns a contact
+      normal and depth rather than a bool — a solver that only knows "they
+      overlap" has to guess a direction, and guesses differently each frame
+- [x] Rigid body simulation, self-written: semi-implicit Euler, impulses with
+      restitution and clamped Coulomb friction, positional correction split by
+      inverse mass. **Linear only** — no angular velocity or inertia tensor,
+      because the output is a character grid where a rolling sphere and a sliding
+      one are the same glyphs
+- [x] Raycasting for gameplay (X picks through the crosshair, line of sight for
+      visibility), sharing `engine/geometry` with the CPU tracer so what the
+      player can click is what the renderer draws
 
 ### 5.2 Audio
-- [ ] Sound playback (WAV, OGG)
-- [ ] 3D spatial audio
-- [ ] Music streaming
+- [x] WAV playback: PCM 8/16/24/32-bit and IEEE float 32/64, including
+      `WAVE_FORMAT_EXTENSIBLE`, with a chunk walker rather than fixed offsets
+- [ ] OGG/Vorbis — not implemented. It needs a codebook decoder, floor and residue
+      decoders and an MDCT: several thousand lines for a second container format,
+      weighed against the rest of the phase and deferred rather than half-built
+- [x] 3D spatial audio: constant-power panning from the listener's own basis,
+      inverse and linear distance falloff, and Doppler from the velocity
+      components along the line of sight only — so an orbiting source has no
+      pitch shift, which a naive speed-based formula gets wrong
+- [x] Music streaming — as an ordinary voice, seeked into, rather than a second
+      code path. Duplicating the resampler and panner for "music" would buy
+      nothing; `Voice::seek` is the whole mechanism
 
 ### 5.3 Scripting
-- [ ] Lua integration (self-written bindings)
-- [ ] Game logic in Lua (entity behaviors, triggers)
-- [ ] Hot-reload Lua scripts
+- [x] Lua integration, self-written: lexer, recursive-descent parser with
+      precedence climbing, tree-walking interpreter, and a standard library
+      subset (print, type, tostring, tonumber, pairs, ipairs, math, string,
+      table, `setmetatable` for `__index`). No coroutines — they need a resumable
+      interpreter, which is a different design rather than an addition
+- [x] Game logic in Lua: scripts queue commands into a mailbox the engine drains
+      once per frame, so a script cannot mutate state mid-frame and what it did
+      is inspectable from Rust. `assets/scripts/demo.lua` drives an entity
+- [x] Hot-reload: watched files are reloaded when their **contents** change.
+      Timestamps are not consulted — measured on NTFS, consecutive writes can
+      report identical modification times, and using them as a pre-check missed
+      about one edit in twenty
 
 ### 5.4 ECS Overhaul
-- [ ] Archetype-based ECS (for cache-friendly iteration)
-- [ ] Component queries (filter by component types)
-- [ ] System pipeline (update order, dependencies)
+- [x] Archetype-based ECS: entities sharing a component-type set keep each type in
+      one contiguous `Vec`, replacing
+      `HashMap<TypeId, HashMap<EntityId, Box<dyn Any>>>` — which boxed every
+      component individually behind two hash lookups. `Scene`'s public API is
+      byte-for-byte unchanged, so no call site needed editing and the pre-existing
+      tests became a regression suite for the new storage
+- [x] Component queries: `entities_with`, `entities_with_both`, and
+      `component_columns` for the packed read path. Results are ordered by creation,
+      because the renderer's per-object GPU indices are derived from them
+- [ ] System pipeline (update order, dependencies) — **not built**. The engine's
+      update order is currently explicit and readable in `AppState::render`
+      (input → scripts → physics → audio → render), about a dozen lines. A
+      scheduler with declared dependencies would replace that with indirection and
+      buy nothing until systems come from outside the engine — plugins, or scripts
+      registering their own. Deferred rather than added as scaffolding
 
 ---
 
