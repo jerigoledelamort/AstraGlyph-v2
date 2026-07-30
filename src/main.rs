@@ -5,6 +5,7 @@
 
 mod app;
 mod ascii;
+mod audio;
 mod demo;
 mod engine;
 mod graphics;

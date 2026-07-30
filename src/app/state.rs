@@ -15,6 +15,8 @@ use crate::scene::{
     Aabb, Camera, CameraMode, CameraRig, ColliderComponent, Entity, Frustum, Hierarchy,
     MaterialComponent, MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
 };
+use crate::audio::device::SAMPLE_RATE;
+use crate::audio::{AudioBuffer, AudioDevice, Listener, Mixer, Spatial, Voice};
 use crate::demo::material_spheres;
 use crate::physics::{ray_through_grid_cell, BodyId, PhysicsWorld, RigidBody};
 use crate::ui::{Console, ConsoleAction, Menu, MenuAction, MenuEvent, MenuItem};
@@ -305,6 +307,27 @@ pub struct AppState {
     trace_key_was_down: bool,
     /// Frames rendered since startup.
     frame_counter: u32,
+    /// Software mixer. Always present, even with no output device: it is where
+    /// spatialisation happens, and the numbers it reports (voice count, peak) are
+    /// worth showing whether or not anyone can hear the result.
+    mixer: Mixer,
+    /// The OS output device, or a silent stand-in.
+    audio_device: AudioDevice,
+    /// Procedurally generated sounds. Generated rather than shipped as files
+    /// because the repository has no audio assets and inventing a `.wav` to commit
+    /// would test the loader against a file this code wrote anyway.
+    sounds: Vec<std::sync::Arc<AudioBuffer>>,
+    /// Which sound the next Space press plays.
+    next_sound: usize,
+    sound_key_was_down: bool,
+    /// A looping positioned voice that orbits the listener, so 3D panning is
+    /// audible without anything else happening. Toggled with O.
+    orbit_playing: bool,
+    orbit_key_was_down: bool,
+    /// Angle of the orbiting source, radians.
+    orbit_angle: f32,
+    /// Camera position last frame, used to derive listener velocity for Doppler.
+    last_listener_position: Vec3,
     /// Rigid-body simulation. Populated from the scene's colliders on first use
     /// and stepped only while enabled, so the default experience is unchanged and
     /// the physics is a thing you switch on and watch.
@@ -474,6 +497,12 @@ impl AppState {
             Some(CpuTracer::new(cpu_trace::DEFAULT_SCALE))
         };
 
+        // Audio is opened here rather than lazily: a machine with no sound card
+        // should say so at startup, next to the GPU report, rather than the first
+        // time someone presses a key.
+        let audio_device = AudioDevice::open();
+        eprintln!("audio: {}", audio_device.status().describe());
+
         // Tracing is the default on either path: it is the point of the phase,
         // and R switches back to rasterising for comparison.
         let traced_enabled = (ray_tracer.is_some() && scene_pipeline.supports_tracing())
@@ -485,6 +514,15 @@ impl AppState {
             ray_tracer,
             cpu_tracer,
             cpu_scene: CpuScene::default(),
+            mixer: Mixer::new(SAMPLE_RATE),
+            audio_device,
+            sounds: crate::audio::demo_sounds(),
+            next_sound: 0,
+            sound_key_was_down: false,
+            orbit_playing: false,
+            orbit_key_was_down: false,
+            orbit_angle: 0.0,
+            last_listener_position: camera.position,
             physics: PhysicsWorld::new(),
             physics_bodies: Vec::new(),
             physics_enabled: false,
@@ -717,6 +755,25 @@ impl AppState {
             eprintln!("glyphs: style = {:?}", self.glyph_style);
         }
         self.style_key_was_down = style_key_down;
+
+        // Space plays the next procedural sound at the crosshair's world position,
+        // O toggles an orbiting looped source (edge-triggered both).
+        let sound_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::Space);
+        if sound_key_down && !self.sound_key_was_down {
+            self.play_next_sound();
+        }
+        self.sound_key_was_down = sound_key_down;
+
+        let orbit_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyO);
+        if orbit_key_down && !self.orbit_key_was_down {
+            self.toggle_orbit_sound();
+        }
+        self.orbit_key_was_down = orbit_key_down;
+
+        self.update_audio(dt);
+
 
         // F runs the rigid-body simulation (edge-triggered), and X casts a
         // gameplay ray through the crosshair.
@@ -1048,6 +1105,100 @@ impl AppState {
 
     pub fn fps(&self) -> f32 {
         self.metrics.fps()
+    }
+
+    /// Point the mixer's listener at the camera, advance the orbiting source, and
+    /// hand the OS whatever samples it will take.
+    ///
+    /// The listener is driven from the camera every frame rather than set once:
+    /// the whole point of spatial audio is that turning your head moves the
+    /// stereo image, and a listener that only tracked position would pan by
+    /// distance alone.
+    fn update_audio(&mut self, dt: f32) {
+        let forward = self.camera.forward();
+        // Velocity from the frame delta, for Doppler. Differenced rather than
+        // stored because the camera rig owns position and exposes no velocity,
+        // and inventing one there would duplicate state that can be derived.
+        let velocity = if dt > 1e-6 {
+            (self.camera.position - self.last_listener_position) / dt
+        } else {
+            Vec3::ZERO
+        };
+        self.last_listener_position = self.camera.position;
+        self.mixer.listener = Listener {
+            position: self.camera.position,
+            forward,
+            up: Vec3::UNIT_Y,
+            velocity,
+        };
+
+        if self.orbit_playing {
+            self.orbit_angle = (self.orbit_angle + dt * 1.2) % std::f32::consts::TAU;
+            let radius = 6.0;
+            let position = Vec3::new(
+                self.orbit_angle.cos() * radius,
+                0.0,
+                self.orbit_angle.sin() * radius,
+            );
+            // Tangential velocity, which by construction produces no Doppler —
+            // the orbiting source is there to demonstrate panning, and a pitch
+            // wobble would muddle what is being shown.
+            let velocity = Vec3::new(
+                -self.orbit_angle.sin(),
+                0.0,
+                self.orbit_angle.cos(),
+            ) * (radius * 1.2);
+            self.mixer.set_spatial_all_looping(Spatial::At {
+                position,
+                velocity,
+                attenuation: crate::audio::Attenuation::default(),
+            });
+        }
+
+        self.audio_device.submit(&mut self.mixer);
+    }
+
+    /// Play the next procedural sound where the crosshair is pointing.
+    fn play_next_sound(&mut self) {
+        if self.sounds.is_empty() {
+            return;
+        }
+        let index = self.next_sound % self.sounds.len();
+        self.next_sound = self.next_sound.wrapping_add(1);
+        // 8 units ahead: far enough for the distance falloff to be audible,
+        // near enough not to be attenuated to nothing.
+        let position = self.camera.position + self.camera.forward() * 8.0;
+        let accepted = self.mixer.play(
+            Voice::new(self.sounds[index].clone())
+                .with_gain(0.6)
+                .spatial(Spatial::at(position)),
+        );
+        eprintln!(
+            "audio: sound {index} at {position} ({}), {} voices",
+            if accepted { "playing" } else { "rejected, mixer full" },
+            self.mixer.voice_count()
+        );
+    }
+
+    /// Start or stop the orbiting looped source.
+    fn toggle_orbit_sound(&mut self) {
+        self.orbit_playing = !self.orbit_playing;
+        if self.orbit_playing {
+            if let Some(buffer) = self.sounds.first() {
+                self.mixer.play(
+                    Voice::new(buffer.clone())
+                        .with_gain(0.5)
+                        .looping(true)
+                        .spatial(Spatial::at(Vec3::new(6.0, 0.0, 0.0))),
+                );
+            }
+        } else {
+            self.mixer.stop_looping();
+        }
+        eprintln!(
+            "audio: orbiting source {}",
+            if self.orbit_playing { "ON" } else { "OFF" }
+        );
     }
 
     /// Build the physics world from the scene's colliders, once.
@@ -1556,6 +1707,9 @@ impl AppState {
                 self.console.print("  phys [on|off]     rigid-body simulation");
                 self.console.print("  gravity <y>       gravity, m/s^2 (default -9.81)");
                 self.console.print("  pick              raycast through the crosshair");
+                self.console.print("  sound [n]         play a procedural sound");
+                self.console.print("  audio             mixer and device state");
+                self.console.print("  volume <0..2>     master gain");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -1737,6 +1891,44 @@ impl AppState {
                     None => self.console.print("nothing under the crosshair"),
                 }
             }
+            "sound" => {
+                if let Some(n) = arg.and_then(|a| a.parse::<usize>().ok()) {
+                    self.next_sound = n;
+                }
+                self.play_next_sound();
+                self.console.print(format!(
+                    "sound: {} voices playing, peak {:.2}",
+                    self.mixer.voice_count(),
+                    self.mixer.peak()
+                ));
+            }
+            "audio" => {
+                self.console
+                    .print(format!("device: {}", self.audio_device.status().describe()));
+                self.console.print(format!(
+                    "mixer: {} voices, master {:.2}, peak {:.2}, {} sounds loaded",
+                    self.mixer.voice_count(),
+                    self.mixer.master_gain,
+                    self.mixer.peak(),
+                    self.sounds.len()
+                ));
+                self.console.print(format!(
+                    "output: {} frames submitted, {} starvations",
+                    self.audio_device.frames_submitted(),
+                    self.audio_device.starved()
+                ));
+                self.console.print(format!(
+                    "listener: pos {} forward {}",
+                    self.mixer.listener.position, self.mixer.listener.forward
+                ));
+            }
+            "volume" => match arg.and_then(|a| a.parse::<f32>().ok()) {
+                Some(v) if v.is_finite() && (0.0..=2.0).contains(&v) => {
+                    self.mixer.master_gain = v;
+                    self.console.print(format!("volume: {v:.2}"));
+                }
+                _ => self.console.print_error("usage: volume <0..2>"),
+            },
             "clear" => {
                 self.console.handle(ConsoleAction::Clear);
             }
@@ -1791,16 +1983,11 @@ impl AppState {
             1,
             4,
             &format!(
-                "COLOR {} POST {}",
+                "STYLE {} COLOR {} POST {}",
+                if self.glyph_style == GlyphStyle::Blocks { "BLOCK" } else { "RAMP" },
                 color_mode_label(self.color_mode),
                 if self.post.any_enabled() { "ON" } else { "OFF" }
             ),
-            DIM,
-        );
-        self.overlay.draw_text(
-            1,
-            5,
-            &format!("STYLE {}", if self.glyph_style == GlyphStyle::Blocks { "BLOCK" } else { "RAMP" }),
             DIM,
         );
         // Which lighting path is running, and what it costs. Without this line
@@ -1808,10 +1995,30 @@ impl AppState {
         // on a simple scene, and "did it switch?" must not be a guess.
         self.overlay.draw_text(
             1,
-            6,
+            5,
             &format!("LIGHT {}", self.lighting_summary()),
             if self.traced_enabled { [0.5, 0.85, 1.0] } else { DIM },
         );
+        // Audio, only when something is playing: a permanent "0 voices" line is
+        // noise, and the interesting case is that a sound is audible at all.
+        if self.mixer.voice_count() > 0 || !self.audio_device.status().is_active() {
+            self.overlay.draw_text(
+                1,
+                6,
+                &format!(
+                    "SND {} {} voices peak {:.2}",
+                    self.audio_device.status().tag(),
+                    self.mixer.voice_count(),
+                    self.mixer.peak()
+                ),
+                if self.mixer.peak() > 1.0 {
+                    [1.0, 0.5, 0.4]
+                } else {
+                    DIM
+                },
+            );
+        }
+
         // Physics and the last pick. A raycast with no visible output cannot be
         // verified by eye at all, so it gets a line of its own.
         if self.physics_enabled || self.last_pick.is_some() {
