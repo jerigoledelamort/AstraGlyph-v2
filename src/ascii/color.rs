@@ -26,7 +26,7 @@
 //   which would make the palette round-trip ambiguous. Use `ColorMode::Ansi16`
 //   when the system colours are wanted.
 // - `luminance` uses the ITU-R BT.601 coefficients 0.299/0.587/0.114, exactly
-//   matching `renderer::ascii_pass` and `ascii::cell_grid`, so a grey-scaled
+//   matching `renderer::ascii_pass`, so a grey-scaled
 //   frame picks the same glyphs as a coloured one.
 // - All inputs are sanitized (NaN -> 0.0, clamp to 0..=1) before use: the shading
 //   pipeline can produce out-of-range or non-finite values, and neither a panic

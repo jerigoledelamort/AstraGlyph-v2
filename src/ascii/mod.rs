@@ -3,7 +3,6 @@
 
 pub mod blocks;
 pub mod box_drawing;
-pub mod cell_grid;
 pub mod color;
 pub mod font5x7;
 pub mod glyph_atlas;

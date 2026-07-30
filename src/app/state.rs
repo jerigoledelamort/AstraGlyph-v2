@@ -257,6 +257,58 @@ fn build_console() -> Console {
 /// the crate root (so it also works when launched from elsewhere).
 const STARTUP_SCENE: &str = "assets/scenes/material_spheres.json";
 
+/// A decoded texture, reduced to what the engine can currently use.
+///
+/// The full pixel buffer is *not* kept: a 4K RGBA image is 64 MiB, and nothing here
+/// samples it yet. Holding megabytes to report a size would be a memory leak dressed
+/// as a feature. What is kept is the metadata plus the average colour — the one value
+/// an ASCII renderer could plausibly take from a texture, and computing it touches
+/// every pixel, so the decode is genuinely exercised rather than merely invoked.
+struct Texture {
+    name: String,
+    width: u32,
+    height: u32,
+    /// Size of the decoded RGBA buffer, before it was discarded.
+    bytes: usize,
+    /// Mean colour in [0, 1], premultiplied by alpha so a transparent region does not
+    /// drag the average toward its unseen colour.
+    average: [f32; 3],
+}
+
+/// Decode a PNG and summarise it.
+fn load_texture(path: &std::path::Path) -> crate::engine::core::Result<Texture> {
+    let image = crate::assets::png::load(path)?;
+    let mut sums = [0.0f64; 3];
+    let mut weight = 0.0f64;
+    for pixel in image.pixels.chunks_exact(4) {
+        let alpha = pixel[3] as f64 / 255.0;
+        for channel in 0..3 {
+            sums[channel] += pixel[channel] as f64 / 255.0 * alpha;
+        }
+        weight += alpha;
+    }
+    // A fully transparent image has no colour to average; zero rather than NaN.
+    let average = if weight > 0.0 {
+        [
+            (sums[0] / weight) as f32,
+            (sums[1] / weight) as f32,
+            (sums[2] / weight) as f32,
+        ]
+    } else {
+        [0.0, 0.0, 0.0]
+    };
+    Ok(Texture {
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string()),
+        width: image.width,
+        height: image.height,
+        bytes: image.byte_size(),
+        average,
+    })
+}
+
 /// Where the startup scene might be. Working directory first, then the crate root.
 fn scene_paths() -> Vec<std::path::PathBuf> {
     vec![
@@ -356,6 +408,10 @@ pub struct AppState {
     assets: AssetWatcher,
     /// Reloads applied since startup, for the profiler.
     asset_reloads: u64,
+    /// Decoded textures. Held rather than dropped so the profiler can report them and
+    /// so a reload has something to replace — see `load_texture` for why the engine
+    /// decodes images it cannot yet draw with.
+    textures: Vec<Texture>,
     /// Scene editor overlay (F2). An in-engine panel rather than a second window —
     /// see `ui::editor` for why.
     editor: Editor,
@@ -613,6 +669,50 @@ impl AppState {
         }
         eprintln!("assets: watching {} file(s)", assets.watched_count());
 
+        // Decode the textures now, and report what came back.
+        //
+        // The engine has no texturing stage — its output is a character grid, and
+        // sampling a texture per glyph is a Phase 7 feature, not a Phase 6 one. But a
+        // decoder nothing calls is a decoder nobody knows is broken: the tests prove
+        // it handles the files they build, and this proves it handles whatever is
+        // actually in `assets/textures`. The decoded average colour is kept because
+        // it is the one thing an ASCII renderer could plausibly use from a texture,
+        // and computing it exercises every pixel.
+        let mut textures = Vec::new();
+        for directory in ["assets/textures"] {
+            let candidates = [
+                std::path::PathBuf::from(directory),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(directory),
+            ];
+            let Some(found) = candidates.into_iter().find(|p| p.is_dir()) else {
+                continue;
+            };
+            if let Ok(entries) = std::fs::read_dir(&found) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "png").unwrap_or(false) {
+                        match load_texture(&path) {
+                            Ok(texture) => {
+                                eprintln!(
+                                    "texture: {} -> {}x{}, {} KiB, average rgb ({:.2}, {:.2}, {:.2})",
+                                    texture.name,
+                                    texture.width,
+                                    texture.height,
+                                    texture.bytes / 1024,
+                                    texture.average[0],
+                                    texture.average[1],
+                                    texture.average[2]
+                                );
+                                textures.push(texture);
+                            }
+                            // A broken texture must not stop the engine starting.
+                            Err(e) => eprintln!("texture: {}: {e}", path.display()),
+                        }
+                    }
+                }
+            }
+        }
+
         // The GPU timer needs the queue for its tick period, so it is built here
         // rather than lazily.
         let gpu_timer = GpuTimer::new(&graphics.device, &graphics.queue);
@@ -654,6 +754,7 @@ impl AppState {
             elapsed: 0.0,
             assets,
             asset_reloads: 0,
+            textures,
             editor: Editor::new(),
             mesh_sources,
             scene_path: scene_paths().into_iter().find(|p| p.exists()),
@@ -1593,6 +1694,29 @@ impl AppState {
                                 eprintln!("assets: {name} failed to load: {e}");
                             }
                         }
+                    } else if path.extension().map(|e| e == "png").unwrap_or(false) {
+                        // A texture: re-decode it, so a broken edit is caught here and
+                        // reported rather than at some later use.
+                        match load_texture(&path) {
+                            Ok(texture) => {
+                                self.console.print(format!(
+                                    "[assets] {name} reloaded: {}x{}, average rgb ({:.2}, {:.2}, {:.2})",
+                                    texture.width,
+                                    texture.height,
+                                    texture.average[0],
+                                    texture.average[1],
+                                    texture.average[2]
+                                ));
+                                match self.textures.iter_mut().find(|t| t.name == texture.name) {
+                                    Some(existing) => *existing = texture,
+                                    None => self.textures.push(texture),
+                                }
+                                self.asset_reloads += 1;
+                            }
+                            Err(e) => self
+                                .console
+                                .print_error(format!("[assets] {name}: {e}")),
+                        }
                     } else {
                         self.asset_reloads += 1;
                         self.console.print(format!(
@@ -1762,6 +1886,19 @@ impl AppState {
             ),
             TEXT,
         );
+        if !self.textures.is_empty() {
+            let pixels: usize = self
+                .textures
+                .iter()
+                .map(|t| t.width as usize * t.height as usize)
+                .sum();
+            row(
+                &mut self.overlay,
+                &mut y,
+                format!("TEX   {} decoded, {} px", self.textures.len(), pixels),
+                TEXT,
+            );
+        }
         if let Some(rt) = self.ray_tracer.as_ref() {
             row(
                 &mut self.overlay,
@@ -2910,6 +3047,18 @@ impl AppState {
                     self.asset_reloads,
                     self.assets.disk_polls()
                 ));
+                for texture in &self.textures {
+                    self.console.print(format!(
+                        "texture {}: {}x{}, {} KiB decoded, average rgb ({:.2}, {:.2}, {:.2})",
+                        texture.name,
+                        texture.width,
+                        texture.height,
+                        texture.bytes / 1024,
+                        texture.average[0],
+                        texture.average[1],
+                        texture.average[2]
+                    ));
+                }
                 if events.is_empty() {
                     self.console.print("nothing changed");
                 } else {

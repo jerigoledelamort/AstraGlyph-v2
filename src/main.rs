@@ -1,6 +1,16 @@
 // AstraGlyph — entry point.
 // ASCII rendering engine: 3D scenes rendered as colored ASCII art.
 
+// Most of what this silences is API surface exercised by unit tests but not (yet) by
+// the engine itself: `Vec2`, the geometry module's shape-shape helpers, mixer and
+// interpreter accessors. Auditing with it off produced 120 warnings, of which exactly
+// one was a real finding — the PNG decoder was never called at runtime, so it is now
+// invoked at startup on whatever is in `assets/textures` (see `AppState::load_texture`).
+//
+// The rest are genuinely-tested code paths kept for the callers they will have, and
+// turning the lint on would mean sprinkling per-item allows to no benefit. Worth
+// re-auditing the same way when a phase lands, since a blanket allow is exactly how a
+// module ends up existing without ever being run.
 #![allow(dead_code)]
 
 mod app;
