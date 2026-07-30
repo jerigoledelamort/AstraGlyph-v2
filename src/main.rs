@@ -11,6 +11,7 @@ mod engine;
 mod graphics;
 mod physics;
 mod renderer;
+mod scripting;
 mod scene;
 mod ui;
 

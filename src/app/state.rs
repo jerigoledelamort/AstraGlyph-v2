@@ -19,6 +19,7 @@ use crate::audio::device::SAMPLE_RATE;
 use crate::audio::{AudioBuffer, AudioDevice, Listener, Mixer, Spatial, Voice};
 use crate::demo::material_spheres;
 use crate::physics::{ray_through_grid_cell, BodyId, PhysicsWorld, RigidBody};
+use crate::scripting::{EngineState, ScriptCommand, ScriptHost};
 use crate::ui::{Console, ConsoleAction, Menu, MenuAction, MenuEvent, MenuItem};
 
 use super::input::InputState;
@@ -218,6 +219,7 @@ fn build_menu() -> Menu {
                 vec!["True".into(), "256".into(), "16".into(), "Grey".into(), "Mono".into()],
                 0,
             ),
+            MenuItem::toggle("Scripts", "lua", false),
             MenuItem::toggle("Physics", "phys", false),
             MenuItem::toggle("Ray tracing", "trace", false),
             MenuItem::toggle("Post FX", "post", false),
@@ -250,6 +252,17 @@ fn build_console() -> Console {
 /// first (so an edited file is picked up by `cargo run`) and then relative to
 /// the crate root (so it also works when launched from elsewhere).
 const STARTUP_SCENE: &str = "assets/scenes/material_spheres.json";
+
+/// Where the demo script might be, in the same order the scene file is looked for:
+/// the working directory first (so an edited file is picked up by `cargo run`),
+/// then the crate root (so it also works when launched from elsewhere).
+fn script_paths() -> Vec<std::path::PathBuf> {
+    const DEMO_SCRIPT: &str = "assets/scripts/demo.lua";
+    vec![
+        std::path::PathBuf::from(DEMO_SCRIPT),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(DEMO_SCRIPT),
+    ]
+}
 
 /// Load the startup scene from disk, falling back to the code-built demo scene
 /// if the file is missing or malformed. The fallback keeps the engine runnable
@@ -307,6 +320,17 @@ pub struct AppState {
     trace_key_was_down: bool,
     /// Frames rendered since startup.
     frame_counter: u32,
+    /// Seconds since startup, published to scripts as `engine.time`.
+    elapsed: f32,
+    /// Lua host: interpreter, engine bindings and the hot-reload watcher.
+    scripts: ScriptHost,
+    /// Whether script `update` runs each frame. On by default when a script was
+    /// found, because a scripting layer nobody can see is indistinguishable from
+    /// one that does not work.
+    scripts_enabled: bool,
+    scripts_key_was_down: bool,
+    /// Last script problem reported, so an every-frame failure logs once.
+    last_script_problem: Option<String>,
     /// Software mixer. Always present, even with no output device: it is where
     /// spatialisation happens, and the numbers it reports (voice count, peak) are
     /// worth showing whether or not anyone can hear the result.
@@ -497,6 +521,23 @@ impl AppState {
             Some(CpuTracer::new(cpu_trace::DEFAULT_SCALE))
         };
 
+        // Scripts are loaded here so a syntax error is reported at startup next to
+        // the GPU and audio lines, rather than silently on the first frame.
+        let mut scripts = ScriptHost::new();
+        for path in script_paths() {
+            if path.exists() {
+                eprintln!("scripts: watching {}", path.display());
+                scripts.watch(&path);
+                break;
+            }
+        }
+        // Enabled only if something was actually loaded: `update` existing is the
+        // test, since a watched-but-missing file leaves no function behind.
+        let scripts_enabled = scripts.interpreter().has_function("update");
+        if let Some(e) = scripts.last_error() {
+            eprintln!("scripts: {e}");
+        }
+
         // Audio is opened here rather than lazily: a machine with no sound card
         // should say so at startup, next to the GPU report, rather than the first
         // time someone presses a key.
@@ -514,6 +555,11 @@ impl AppState {
             ray_tracer,
             cpu_tracer,
             cpu_scene: CpuScene::default(),
+            elapsed: 0.0,
+            scripts,
+            scripts_enabled,
+            scripts_key_was_down: false,
+            last_script_problem: None,
             mixer: Mixer::new(SAMPLE_RATE),
             audio_device,
             sounds: crate::audio::demo_sounds(),
@@ -755,6 +801,21 @@ impl AppState {
             eprintln!("glyphs: style = {:?}", self.glyph_style);
         }
         self.style_key_was_down = style_key_down;
+
+        // L toggles script execution (edge-triggered).
+        let scripts_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyL);
+        if scripts_key_down && !self.scripts_key_was_down {
+            self.scripts_enabled = !self.scripts_enabled;
+            eprintln!(
+                "scripts: {}",
+                if self.scripts_enabled { "ON" } else { "OFF" }
+            );
+        }
+        self.scripts_key_was_down = scripts_key_down;
+
+        self.elapsed += dt;
+        self.update_scripts(dt);
 
         // Space plays the next procedural sound at the crosshair's world position,
         // O toggles an orbiting looped source (edge-triggered both).
@@ -1105,6 +1166,141 @@ impl AppState {
 
     pub fn fps(&self) -> f32 {
         self.metrics.fps()
+    }
+
+    /// Reload changed scripts, run their `update`, and apply what they asked for.
+    ///
+    /// Reload polling happens whether or not scripts are enabled, so re-enabling
+    /// them picks up the current file rather than a stale one.
+    fn update_scripts(&mut self, dt: f32) {
+        let reloaded = self.scripts.poll_reloads();
+        if reloaded > 0 {
+            // Drain the script's own print output into the console, so a reload's
+            // messages appear where the author is looking.
+            self.flush_script_output();
+        }
+        if !self.scripts_enabled {
+            return;
+        }
+
+        let state = EngineState {
+            time: self.elapsed,
+            dt,
+            frame: self.frame_counter,
+            fps: self.metrics.fps(),
+            camera_position: self.camera.position,
+            entity_count: self.scene.all_entities().len() as u32,
+        };
+        // `update` returning Err would mean the host itself failed; a *script*
+        // error is reported inside and does not fail the frame.
+        if let Err(e) = self.scripts.update(&state) {
+            eprintln!("scripts: host error: {e}");
+            self.scripts_enabled = false;
+        }
+        let commands = self.scripts.drain_commands();
+        self.apply_script_commands(commands);
+        self.flush_script_output();
+    }
+
+    /// Move whatever scripts printed into the engine console.
+    fn flush_script_output(&mut self) {
+        if self.scripts.output().is_empty() {
+            return;
+        }
+        let lines: Vec<String> = self.scripts.output().to_vec();
+        self.scripts.interpreter().clear_output();
+        for line in lines {
+            self.console.print(format!("[lua] {line}"));
+        }
+    }
+
+    /// Apply one frame's worth of script commands.
+    ///
+    /// This is the single point where a script touches engine state — see
+    /// `scripting::bindings` for why. Every unknown or out-of-range target is
+    /// reported rather than ignored: a script quietly moving nothing is the hardest
+    /// scripting bug to find.
+    fn apply_script_commands(&mut self, commands: Vec<ScriptCommand>) {
+        for command in commands {
+            match command {
+                ScriptCommand::SetPosition { entity, position } => {
+                    self.with_script_entity(entity, "set_position", |transform| {
+                        transform.local.position = position;
+                    });
+                }
+                ScriptCommand::Translate { entity, delta } => {
+                    self.with_script_entity(entity, "translate", |transform| {
+                        transform.local.position = transform.local.position + delta;
+                    });
+                }
+                ScriptCommand::SetScale { entity, scale } => {
+                    self.with_script_entity(entity, "set_scale", |transform| {
+                        transform.local.scale = Vec3::splat(scale);
+                    });
+                }
+                ScriptCommand::Log(text) => self.console.print(format!("[lua] {text}")),
+                ScriptCommand::PlaySound { index, position } => {
+                    if let Some(buffer) = self.sounds.get(index % self.sounds.len().max(1)) {
+                        self.mixer.play(
+                            Voice::new(buffer.clone())
+                                .with_gain(0.5)
+                                .spatial(Spatial::at(position)),
+                        );
+                    }
+                }
+                ScriptCommand::SetPhysics(on) => {
+                    if on != self.physics_enabled {
+                        self.toggle_physics();
+                    }
+                }
+                ScriptCommand::SetTracing(on) => {
+                    if on != self.traced_enabled {
+                        self.toggle_tracing();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply `f` to an entity's transform, reporting an id that does not resolve.
+    ///
+    /// Script-visible ids are the scene's own entity ids, matched against the
+    /// entity list rather than trusted: a stale id after a scene change would
+    /// otherwise create a component on an entity that does not exist.
+    fn with_script_entity(
+        &mut self,
+        id: u64,
+        what: &str,
+        f: impl FnOnce(&mut TransformComponent),
+    ) {
+        let entity = self
+            .scene
+            .all_entities()
+            .iter()
+            .copied()
+            .find(|e| e.id() == id);
+        let Some(entity) = entity else {
+            self.report_script_problem(format!("{what}: no entity with id {id}"));
+            return;
+        };
+        match self.scene.get_component_mut::<TransformComponent>(entity) {
+            Some(transform) => f(transform),
+            None => self.report_script_problem(format!(
+                "{what}: entity {id} has no transform to change"
+            )),
+        }
+    }
+
+    /// Report a script problem once rather than once per frame.
+    ///
+    /// A script calling a bad id every frame at 1300 FPS would otherwise print
+    /// 1300 identical lines a second and bury everything else in the console.
+    fn report_script_problem(&mut self, message: String) {
+        if self.last_script_problem.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        self.console.print_error(format!("[lua] {message}"));
+        self.last_script_problem = Some(message);
     }
 
     /// Point the mixer's listener at the camera, advance the orbiting source, and
@@ -1590,6 +1786,7 @@ impl AppState {
         };
         self.menu.set_choice("style", style);
         self.menu.set_choice("color", color);
+        self.menu.set_toggle("lua", self.scripts_enabled);
         self.menu.set_toggle("phys", self.physics_enabled);
         self.menu.set_toggle("trace", self.traced_enabled);
         self.menu.set_toggle("post", self.post.any_enabled());
@@ -1611,6 +1808,7 @@ impl AppState {
                 _ => {}
             },
             MenuEvent::Toggled(id, on) => match id.as_str() {
+                "lua" => self.scripts_enabled = on,
                 "phys" => {
                     if on != self.physics_enabled {
                         self.toggle_physics();
@@ -1622,7 +1820,8 @@ impl AppState {
                     }
                     // The menu may have moved ahead of reality (no ray query on
                     // this machine), so push the truth back into it.
-                    self.menu.set_toggle("phys", self.physics_enabled);
+                    self.menu.set_toggle("lua", self.scripts_enabled);
+        self.menu.set_toggle("phys", self.physics_enabled);
         self.menu.set_toggle("trace", self.traced_enabled);
                 }
                 "post" => {
@@ -1710,6 +1909,9 @@ impl AppState {
                 self.console.print("  sound [n]         play a procedural sound");
                 self.console.print("  audio             mixer and device state");
                 self.console.print("  volume <0..2>     master gain");
+                self.console.print("  lua <code>        evaluate Lua");
+                self.console.print("  scripts [on|off]  run the script's update()");
+                self.console.print("  reload            reload watched scripts");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -1929,6 +2131,48 @@ impl AppState {
                 }
                 _ => self.console.print_error("usage: volume <0..2>"),
             },
+            "lua" => {
+                // Everything after the command word, so `lua print(1 + 1)` works
+                // rather than being split on whitespace into arguments.
+                let code = line.trim_start().strip_prefix("lua").unwrap_or("").trim();
+                if code.is_empty() {
+                    self.console.print_error("usage: lua <code>");
+                } else {
+                    match self.scripts.eval(code) {
+                        Ok(values) => {
+                            if !values.is_empty() {
+                                let rendered: Vec<String> = values
+                                    .iter()
+                                    .map(crate::scripting::interp::tostring)
+                                    .collect();
+                                self.console.print(rendered.join("\t"));
+                            }
+                        }
+                        Err(e) => self.console.print_error(format!("{e}")),
+                    }
+                    let commands = self.scripts.drain_commands();
+                    self.apply_script_commands(commands);
+                    self.flush_script_output();
+                }
+            }
+            "scripts" => {
+                self.scripts_enabled = on_off(arg, self.scripts_enabled);
+                self.console.print(format!(
+                    "scripts: {} ({} reloads)",
+                    if self.scripts_enabled { "on" } else { "off" },
+                    self.scripts.reloads()
+                ));
+            }
+            "reload" => {
+                let reloaded = self.scripts.poll_reloads();
+                self.flush_script_output();
+                match self.scripts.last_error() {
+                    Some(e) => self.console.print_error(e.to_string()),
+                    None => self
+                        .console
+                        .print(format!("reload: {reloaded} file(s) changed")),
+                }
+            }
             "clear" => {
                 self.console.handle(ConsoleAction::Clear);
             }
@@ -2012,6 +2256,25 @@ impl AppState {
                     self.mixer.peak()
                 ),
                 if self.mixer.peak() > 1.0 {
+                    [1.0, 0.5, 0.4]
+                } else {
+                    DIM
+                },
+            );
+        }
+
+        // Scripts, when a script is live. Reload count rather than a bare "on":
+        // "hot-reload works" is a claim, "3 reloads" is an observation.
+        if self.scripts_enabled || self.scripts.last_error().is_some() {
+            let text = match self.scripts.last_error() {
+                Some(_) => "LUA ERROR - SEE CONSOLE".to_string(),
+                None => format!("LUA ON {} reloads", self.scripts.reloads()),
+            };
+            self.overlay.draw_text(
+                1,
+                10,
+                &text,
+                if self.scripts.last_error().is_some() {
                     [1.0, 0.5, 0.4]
                 } else {
                     DIM
