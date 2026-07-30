@@ -229,7 +229,7 @@ fn add_entity(
 fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
     let kind = value
         .get_str("type")
-        .ok_or_else(|| err("mesh: missing \"type\" (\"plane\" or \"sphere\")"))?;
+        .ok_or_else(|| err("mesh: missing \"type\" (\"plane\", \"sphere\" or \"obj\")"))?;
     let color = vec3_field(value, "color").unwrap_or(Vec3::ONE);
     // Geometry is authored at the origin; placement belongs to the transform.
     let center = Vec3::ZERO;
@@ -241,6 +241,62 @@ fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
                 return Err(err("plane mesh: \"size\" must be positive"));
             }
             Ok((plane(center, size, color), plane_shape(size)))
+        }
+        // An external model. Resolved relative to the working directory first, then
+        // the crate root — the same order the scene file itself is found, so a scene
+        // and its models travel together.
+        "obj" => {
+            let file = value
+                .get_str("path")
+                .ok_or_else(|| err("obj mesh: missing \"path\""))?;
+            let candidates = [
+                std::path::PathBuf::from(file),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file),
+            ];
+            let path = candidates
+                .into_iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| err(format!("obj mesh: {file:?} not found")))?;
+            let model = crate::assets::obj::load(&path)?;
+            if model.skipped_faces > 0 {
+                // Reported rather than silently accepted: a model that lost faces
+                // renders as a mesh with holes, which looks like a renderer bug.
+                eprintln!(
+                    "obj: {} loaded with {} skipped face(s)",
+                    path.display(),
+                    model.skipped_faces
+                );
+            }
+            eprintln!(
+                "obj: {} -> {} vertices, {} triangles{}",
+                path.display(),
+                model.mesh.vertices.len(),
+                model.mesh.indices.len() / 3,
+                if model.triangulated_faces > 0 {
+                    format!(" ({} face(s) triangulated)", model.triangulated_faces)
+                } else {
+                    String::new()
+                }
+            );
+            // Recolour if the scene asked. An OBJ carries no colours in the base
+            // format, so without this every loaded model would be the loader's
+            // default grey regardless of what the scene file said.
+            let mut mesh = model.mesh;
+            if let Some(color) = vec3_field(value, "color") {
+                for vertex in &mut mesh.vertices {
+                    vertex.color = color;
+                }
+            }
+            // The analytic collider is a sphere around the model's bounds: a
+            // triangle-accurate collider would need a BVH, and a bounding sphere is
+            // both honest about being approximate and useful for broad-phase.
+            let radius = mesh
+                .vertices
+                .iter()
+                .map(|v| v.position.length())
+                .fold(0.0f32, f32::max)
+                .max(0.001);
+            Ok((mesh, crate::engine::geometry::Shape::Sphere { radius }))
         }
         "sphere" => {
             let radius = value.get_f32("radius").unwrap_or(1.0);
@@ -255,7 +311,7 @@ fn parse_mesh(value: &json::JsonValue) -> Result<(MeshComponent, Shape)> {
             ))
         }
         other => Err(err(format!(
-            "mesh: unknown type {other:?} (expected \"plane\" or \"sphere\")"
+            "mesh: unknown type {other:?} (expected \"plane\", \"sphere\" or \"obj\")"
         ))),
     }
 }
@@ -613,8 +669,21 @@ mod tests {
         assert_eq!(loaded.lights.len(), 2);
         assert_eq!(
             loaded.scene.entities_with::<MeshComponent>().len(),
-            5,
-            "ground, three spheres, and the blue sphere's satellite child"
+            6,
+            "ground, three spheres, the blue sphere's satellite child, and the OBJ pyramid"
+        );
+        // The pyramid comes from an external file, so this also proves the "obj" mesh
+        // type resolves and parses through the real scene path — a broken model file
+        // or a path that stopped resolving would fail the load above.
+        let pyramid = loaded
+            .scene
+            .entities_with::<MeshComponent>()
+            .into_iter()
+            .filter_map(|e| loaded.scene.get_component::<MeshComponent>(e))
+            .find(|m| m.indices.len() == 18);
+        assert!(
+            pyramid.is_some(),
+            "the OBJ pyramid should contribute 6 triangles (its quad base triangulated)"
         );
         // The satellite is nested, so exactly one entity must have a parent.
         let parented = loaded

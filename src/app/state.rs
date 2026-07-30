@@ -16,6 +16,7 @@ use crate::scene::{
     Aabb, Camera, CameraMode, CameraRig, ColliderComponent, Entity, Frustum, Hierarchy,
     MaterialComponent, MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
 };
+use crate::assets::hot_reload::{AssetWatcher, ReloadEvent};
 use crate::audio::device::SAMPLE_RATE;
 use crate::audio::{AudioBuffer, AudioDevice, Listener, Mixer, Spatial, Voice};
 use crate::demo::material_spheres;
@@ -255,6 +256,14 @@ fn build_console() -> Console {
 /// the crate root (so it also works when launched from elsewhere).
 const STARTUP_SCENE: &str = "assets/scenes/material_spheres.json";
 
+/// Where the startup scene might be. Working directory first, then the crate root.
+fn scene_paths() -> Vec<std::path::PathBuf> {
+    vec![
+        std::path::PathBuf::from(STARTUP_SCENE),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(STARTUP_SCENE),
+    ]
+}
+
 /// Where the demo script might be, in the same order the scene file is looked for:
 /// the working directory first (so an edited file is picked up by `cargo run`),
 /// then the crate root (so it also works when launched from elsewhere).
@@ -271,10 +280,7 @@ fn script_paths() -> Vec<std::path::PathBuf> {
 /// while a scene file is being edited; which path was taken is logged so a
 /// silent fallback can't be mistaken for a successful load.
 fn load_startup_scene() -> (Scene, Camera, Vec<LightUniform>, Hierarchy) {
-    let candidates = [
-        std::path::PathBuf::from(STARTUP_SCENE),
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(STARTUP_SCENE),
-    ];
+    let candidates = scene_paths();
 
     for path in &candidates {
         if !path.exists() {
@@ -324,6 +330,11 @@ pub struct AppState {
     frame_counter: u32,
     /// Seconds since startup, published to scripts as `engine.time`.
     elapsed: f32,
+    /// Watches the scene file and any model or texture it references, so editing one
+    /// takes effect without a restart (Phase 6.2).
+    assets: AssetWatcher,
+    /// Reloads applied since startup, for the profiler.
+    asset_reloads: u64,
     /// Real per-pass GPU timings from timestamp queries, replacing the wall-clock
     /// estimate `FrameMetrics` has always reported. Disabled on adapters without
     /// `TIMESTAMP_QUERY`, in which case it says so rather than reporting zeros.
@@ -531,6 +542,39 @@ impl AppState {
             Some(CpuTracer::new(cpu_trace::DEFAULT_SCALE))
         };
 
+        // Watch the scene file and its assets. The scene is watched even though
+        // reloading it is the heaviest reload, because it is the file most often
+        // edited while the engine runs.
+        let mut assets = AssetWatcher::default();
+        for path in scene_paths() {
+            if path.exists() {
+                assets.watch(&path);
+                break;
+            }
+        }
+        for directory in ["assets/models", "assets/textures"] {
+            let candidates = [
+                std::path::PathBuf::from(directory),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(directory),
+            ];
+            let Some(found) = candidates.into_iter().find(|p| p.is_dir()) else {
+                continue;
+            };
+            // Files present at startup only. A file added later is not picked up,
+            // which is a real limitation: watching a directory for *new* entries
+            // needs a different mechanism than fingerprinting known paths, and
+            // editing an existing asset is the case that matters.
+            if let Ok(entries) = std::fs::read_dir(&found) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        assets.watch(&path);
+                    }
+                }
+            }
+        }
+        eprintln!("assets: watching {} file(s)", assets.watched_count());
+
         // The GPU timer needs the queue for its tick period, so it is built here
         // rather than lazily.
         let gpu_timer = GpuTimer::new(&graphics.device, &graphics.queue);
@@ -570,6 +614,8 @@ impl AppState {
             cpu_tracer,
             cpu_scene: CpuScene::default(),
             elapsed: 0.0,
+            assets,
+            asset_reloads: 0,
             gpu_timer,
             profiler_visible: false,
             profiler_key_was_down: false,
@@ -854,6 +900,7 @@ impl AppState {
         self.scripts_key_was_down = scripts_key_down;
 
         self.elapsed += dt;
+        self.poll_assets();
         self.update_scripts(dt);
 
         // Space plays the next procedural sound at the crosshair's world position,
@@ -1227,6 +1274,92 @@ impl AppState {
         self.metrics.fps()
     }
 
+    /// Reload any asset whose contents changed on disk.
+    ///
+    /// Rate-limited inside the watcher (250 ms), so this costs one `is_due` check on
+    /// the overwhelming majority of frames.
+    fn poll_assets(&mut self) {
+        let events = self.assets.poll(std::time::Instant::now());
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                ReloadEvent::Changed(path) | ReloadEvent::Appeared(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    // The scene file is the only asset the engine can currently act
+                    // on by itself: a changed model or texture is reported, but
+                    // applying it means knowing which entity uses it, and nothing
+                    // records that yet. Saying so beats pretending it reloaded.
+                    if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        match crate::scene::load_scene_file(&path) {
+                            Ok(loaded) => {
+                                self.replace_scene(loaded);
+                                self.asset_reloads += 1;
+                                self.console.print(format!("[assets] reloaded {name}"));
+                                eprintln!("assets: reloaded scene {name}");
+                            }
+                            Err(e) => {
+                                // The running scene is kept: a broken edit should be
+                                // fixable without losing the session.
+                                self.console
+                                    .print_error(format!("[assets] {name}: {e}"));
+                                eprintln!("assets: {name} failed to load: {e}");
+                            }
+                        }
+                    } else {
+                        self.asset_reloads += 1;
+                        self.console.print(format!(
+                            "[assets] {name} changed (restart or edit the scene to apply)"
+                        ));
+                    }
+                }
+                ReloadEvent::Removed(path) => {
+                    self.console.print_error(format!(
+                        "[assets] {} was removed; keeping the loaded version",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Swap in a freshly loaded scene, resetting everything derived from the old one.
+    ///
+    /// The derived state is the part that matters: physics bodies hold entity handles
+    /// from the *old* scene, and the ray tracer caches geometry per entity id. Keeping
+    /// either across a reload would have the simulation pushing entities that no
+    /// longer exist and the tracer reflecting geometry that was deleted.
+    fn replace_scene(&mut self, loaded: crate::scene::LoadedScene) {
+        self.scene = loaded.scene;
+        self.hierarchy = loaded.hierarchy;
+        self.lights = loaded.lights;
+        self.camera_rig = seed_rig_from_camera(&loaded.camera);
+        // The projection comes from the file, but the aspect ratio comes from the
+        // window — so it is preserved rather than reset to whatever the file said.
+        let aspect = self.graphics.width as f32 / self.graphics.height.max(1) as f32;
+        self.camera = loaded.camera;
+        self.camera.set_aspect(aspect);
+
+        self.physics = PhysicsWorld::new();
+        self.physics_bodies.clear();
+        if self.physics_enabled {
+            self.build_physics();
+        }
+        // A fresh tracer: BLASes are keyed by entity id, and the new scene reuses
+        // those ids for different geometry.
+        self.ray_tracer = if self.graphics.ray_tracing().is_enabled() {
+            Some(RayTracer::new(&self.graphics.device))
+        } else {
+            None
+        };
+        self.cpu_scene = CpuScene::default();
+        self.last_pick = None;
+    }
+
     /// Draw the profiler overlay: frame breakdown, GPU per-pass timings, draw
     /// calls, memory and ECS storage shape.
     ///
@@ -1333,6 +1466,16 @@ impl AppState {
             &mut self.overlay,
             &mut y,
             format!("ECS   {archetypes} arch, {migrations} moves"),
+            TEXT,
+        );
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!(
+                "ASSET {} watched, {} reloads",
+                self.assets.watched_count(),
+                self.asset_reloads
+            ),
             TEXT,
         );
         if let Some(rt) = self.ray_tracer.as_ref() {
@@ -2120,6 +2263,7 @@ impl AppState {
                 self.console.print("  scripts [on|off]  run the script's update()");
                 self.console.print("  reload            reload watched scripts");
                 self.console.print("  perf              frame timing breakdown");
+                self.console.print("  assets            watched files, force a reload");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -2379,6 +2523,23 @@ impl AppState {
                     None => self
                         .console
                         .print(format!("reload: {reloaded} file(s) changed")),
+                }
+            }
+            "assets" => {
+                let events = self.assets.poll_now(std::time::Instant::now());
+                self.console.print(format!(
+                    "watching {} file(s), {} reloads, {} disk polls",
+                    self.assets.watched_count(),
+                    self.asset_reloads,
+                    self.assets.disk_polls()
+                ));
+                if events.is_empty() {
+                    self.console.print("nothing changed");
+                } else {
+                    for event in events {
+                        self.console
+                            .print(format!("changed: {}", event.path().display()));
+                    }
                 }
             }
             "perf" => {

@@ -229,9 +229,30 @@ cores on the target hardware.
 - [ ] Property inspector (edit component values)
 
 ### 6.2 Asset Pipeline
-- [ ] Model loader (OBJ, glTF — parse manually)
-- [ ] Texture loader (PNG, JPEG → wgpu textures)
-- [ ] Asset hot-reload (edit assets without restarting)
+- [x] OBJ model loader, hand-written. Handles 1-based *and* negative indices, all
+      four face-vertex forms (`1`, `1/2`, `1//3`, `1/2/3`), n-gon fan triangulation,
+      per-triple vertex deduplication (so a cube keeps hard edges) and
+      winding-derived normals where the file has none. Wired into the scene format
+      as `"mesh": { "type": "obj", "path": ... }` and exercised by the demo scene
+- [ ] glTF — **not implemented**. It is JSON plus binary buffer views plus an
+      accessor indirection layer plus optional Draco compression: a container
+      standard rather than a file format, and several times the work of OBJ for a
+      hand-written parser. Deferred rather than half-built
+- [x] PNG texture decoder, hand-written, including the DEFLATE (RFC 1951) inflater
+      it requires — fixed and dynamic Huffman blocks, stored blocks, and overlapping
+      back-references. 8/16-bit greyscale, RGB, palette (with `tRNS`), greyscale+alpha
+      and RGBA; all five scanline filters; Adam7 interlacing. Verified against a real
+      zlib-compressed fixture, not just hand-built stored blocks
+- [ ] JPEG — **not implemented**. It needs a DCT, quantisation tables, Huffman
+      tables, chroma subsampling and YCbCr conversion, for a lossy format whose
+      artefacts are worse than useless at this engine's output resolution
+- [x] Asset hot-reload: `assets/hot_reload.rs` watches by **contents**, not
+      timestamps — the same lesson as the script watcher, where NTFS reported
+      identical modification times for consecutive writes. Rate-limited to 250 ms so
+      it stays off the hot path. Editing the scene file reloads it live; a broken
+      edit is rejected with a byte offset and the running scene survives. A changed
+      model or texture is *reported* but not applied, because nothing yet records
+      which entity uses which file — said plainly rather than claimed
 
 ### 6.3 Profiler
 - [x] Overlay with frame breakdown (F3, or `perf` in the console): frame time, CPU

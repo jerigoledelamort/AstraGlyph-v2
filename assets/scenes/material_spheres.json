@@ -110,6 +110,25 @@
       ]
     },
     {
+      "name": "pyramid_from_obj",
+      "comment": "loaded from assets/models/pyramid.obj, to exercise the OBJ loader: quad base (triangulated on load) and no vn directives (normals derived from winding)",
+      "transform": {
+        "position": [-5.5, -2.0, 1.0],
+        "scale": [1.2, 1.2, 1.2]
+      },
+      "mesh": {
+        "type": "obj",
+        "path": "assets/models/pyramid.obj",
+        "color": [0.9, 0.7, 0.2]
+      },
+      "material": {
+        "type": "matte",
+        "color": [0.9, 0.7, 0.2, 1.0],
+        "ambient": 0.12,
+        "diffuse": 0.88
+      }
+    },
+    {
       "name": "green_sphere_glass",
       "comment": "in FRONT of the matte and mirror spheres, and wide enough to overlap both, so the tint pass is visible: what is behind it should turn green",
       "transform": {

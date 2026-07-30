@@ -1,0 +1,18 @@
+# A square pyramid, for testing the OBJ loader.
+#
+# Deliberately written with a quad base (exercising fan triangulation) and with no
+# vn directives (exercising winding-derived normals). Coordinates are in a unit
+# cube so it can be scaled by its transform like the primitives.
+o pyramid
+v -1.0  0.0 -1.0
+v  1.0  0.0 -1.0
+v  1.0  0.0  1.0
+v -1.0  0.0  1.0
+v  0.0  1.5  0.0
+# Base, wound so its normal points down.
+f 1 2 3 4
+# Four sides, wound counter-clockwise seen from outside.
+f 1 5 2
+f 2 5 3
+f 3 5 4
+f 4 5 1
