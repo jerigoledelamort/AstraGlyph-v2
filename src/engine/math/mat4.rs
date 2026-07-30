@@ -92,6 +92,56 @@ impl Mat4 {
     }
 
     /// Transpose the matrix.
+    /// Inverse of an affine transform (rotation, scale, translation).
+    ///
+    /// Not a general 4x4 inverse: it assumes the bottom row is `(0, 0, 0, 1)`,
+    /// which every transform this engine builds satisfies and no projection matrix
+    /// does. That restriction is what makes it a closed form — invert the upper
+    /// 3x3, then apply it to the negated translation — rather than a cofactor
+    /// expansion, and it means a projection matrix passed here silently gets
+    /// nonsense. `None` is returned when the 3x3 part is singular (a zero scale
+    /// on some axis), because there is genuinely no inverse then and returning
+    /// identity would quietly move whatever was being un-transformed.
+    pub fn inverse_affine(self) -> Option<Self> {
+        // Element (row, col) is at m[col * 4 + row].
+        let m = |r: usize, c: usize| self.m[c * 4 + r];
+        // Cofactors of the upper 3x3.
+        let c00 = m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1);
+        let c01 = m(1, 2) * m(2, 0) - m(1, 0) * m(2, 2);
+        let c02 = m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0);
+        let det = m(0, 0) * c00 + m(0, 1) * c01 + m(0, 2) * c02;
+        if det.abs() < 1e-12 || !det.is_finite() {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+
+        // Adjugate, transposed into the inverse.
+        let i00 = c00 * inv_det;
+        let i01 = (m(0, 2) * m(2, 1) - m(0, 1) * m(2, 2)) * inv_det;
+        let i02 = (m(0, 1) * m(1, 2) - m(0, 2) * m(1, 1)) * inv_det;
+        let i10 = c01 * inv_det;
+        let i11 = (m(0, 0) * m(2, 2) - m(0, 2) * m(2, 0)) * inv_det;
+        let i12 = (m(0, 2) * m(1, 0) - m(0, 0) * m(1, 2)) * inv_det;
+        let i20 = c02 * inv_det;
+        let i21 = (m(0, 1) * m(2, 0) - m(0, 0) * m(2, 1)) * inv_det;
+        let i22 = (m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0)) * inv_det;
+
+        // The inverse translation is the inverted rotation applied to -t.
+        let (tx, ty, tz) = (m(0, 3), m(1, 3), m(2, 3));
+        let t0 = -(i00 * tx + i01 * ty + i02 * tz);
+        let t1 = -(i10 * tx + i11 * ty + i12 * tz);
+        let t2 = -(i20 * tx + i21 * ty + i22 * tz);
+
+        Some(Self {
+            m: [
+                i00, i10, i20, 0.0, //
+                i01, i11, i21, 0.0, //
+                i02, i12, i22, 0.0, //
+                t0, t1, t2, 1.0,
+            ],
+        })
+    }
+
     pub fn transpose(self) -> Self {
         let m = self.m;
         Self {
@@ -274,6 +324,56 @@ mod tests {
         let p = Vec3::new(1.0, 0.0, 0.0);
         let r = m.transform_dir(p);
         assert!((r - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5);
+    }
+
+    /// The property that matters: composing a matrix with its inverse must be
+    /// the identity, checked by round-tripping points rather than by comparing
+    /// floats element by element.
+    #[test]
+    fn inverse_affine_round_trips_points() {
+        let cases = [
+            Mat4::translation(3.0, -4.0, 5.0),
+            Mat4::scaling(2.0, 3.0, 0.5),
+            Mat4::rotation_y(0.7),
+            Mat4::translation(1.0, 2.0, 3.0)
+                .mul(Mat4::rotation_y(0.9))
+                .mul(Mat4::scaling(2.0, 2.0, 2.0)),
+            Mat4::translation(-2.0, 0.5, 1.5)
+                .mul(Mat4::rotation_x(0.3))
+                .mul(Mat4::rotation_z(-1.1))
+                .mul(Mat4::scaling(1.5, 0.5, 3.0)),
+        ];
+        let points = [
+            Vec3::ZERO,
+            Vec3::UNIT_X,
+            Vec3::UNIT_Y,
+            Vec3::UNIT_Z,
+            Vec3::new(-3.5, 7.25, 0.125),
+        ];
+        for m in cases {
+            let inv = m.inverse_affine().expect("these are all invertible");
+            for p in points {
+                let round_tripped = inv.transform_point(m.transform_point(p));
+                assert!(
+                    (round_tripped - p).length() < 1e-4,
+                    "point {p} came back as {round_tripped}"
+                );
+            }
+        }
+    }
+
+    /// A singular matrix has no inverse. Returning identity instead would quietly
+    /// leave whatever was being un-transformed in the wrong place.
+    #[test]
+    fn inverse_affine_refuses_a_singular_matrix() {
+        assert!(Mat4::scaling(1.0, 0.0, 1.0).inverse_affine().is_none());
+        assert!(Mat4::zero().inverse_affine().is_none());
+    }
+
+    #[test]
+    fn inverse_of_the_identity_is_the_identity() {
+        let inv = Mat4::IDENTITY.inverse_affine().unwrap();
+        assert_eq!(inv, Mat4::IDENTITY);
     }
 
     #[test]

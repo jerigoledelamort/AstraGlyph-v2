@@ -6,8 +6,11 @@
 // raycast that disagreed would show the player in a mirror somewhere other than
 // where they can be hit.
 
+pub mod collision;
 pub mod ray;
 pub mod shapes;
 
+// `Contact` and `ContactPair` are used through `collision::` by the physics
+// world; re-exporting them here as well would be an unused import.
 pub use ray::{Ray, RayHit};
-pub use shapes::{Shape, WorldShape};
+pub use shapes::{Basis, Shape, WorldShape};

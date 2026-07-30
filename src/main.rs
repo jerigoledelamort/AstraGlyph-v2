@@ -8,6 +8,7 @@ mod ascii;
 mod demo;
 mod engine;
 mod graphics;
+mod physics;
 mod renderer;
 mod scene;
 mod ui;

@@ -46,13 +46,15 @@ impl Shape {
 
     /// The shape placed in world space by `model`.
     ///
-    /// Only the parts of a transform an analytic shape can absorb are applied:
-    /// translation moves the origin, and scale changes the extents. A rotation
-    /// applied to a sphere is a no-op; applied to a box or plane it is *not*
-    /// representable, so the box stays axis-aligned and the plane's normal is
-    /// rotated while its extent is not sheared. The approximation is documented
-    /// rather than hidden because the alternative — silently rotating extents —
-    /// produces colliders that do not match the drawn geometry.
+    /// Translation moves the origin, scale changes the extents, and rotation goes
+    /// into the resulting shape's `basis` — so a rotated box really is an
+    /// oriented box rather than a silently axis-aligned one.
+    ///
+    /// The one thing still approximated is non-uniform scale on a sphere: this
+    /// shape set has no ellipsoid, so the largest axis is taken and the volume
+    /// encloses the drawn mesh instead of matching it. Documented rather than
+    /// hidden, because a collider that quietly disagrees with the geometry is
+    /// how "the reflection is in the wrong place" bugs start.
     pub fn transformed(&self, model: &Mat4) -> WorldShape {
         let origin = model.transform_point(Vec3::ZERO);
         // Column lengths of the upper 3x3 are the per-axis scale factors.
@@ -78,11 +80,94 @@ impl Shape {
                 half_size: half_size * sx.max(sz),
             },
         };
-        WorldShape { origin, shape }
+        WorldShape {
+            origin,
+            shape,
+            basis: Basis::from_matrix(model),
+        }
     }
 }
 
-/// A shape positioned in world space.
+/// An orthonormal rotation, stored as its three column vectors.
+///
+/// A 3x3 rotation rather than a full `Mat4` because that is all a shape's
+/// orientation is, and because the two operations that matter — rotating a
+/// direction into the shape's local frame and back out — are a transpose and a
+/// multiply on exactly these three vectors. Reusing `Mat4` would invite the
+/// translation to come along, which for a shape is already in `origin`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Basis {
+    pub x: Vec3,
+    pub y: Vec3,
+    pub z: Vec3,
+}
+
+impl Basis {
+    pub const IDENTITY: Self = Self {
+        x: Vec3::UNIT_X,
+        y: Vec3::UNIT_Y,
+        z: Vec3::UNIT_Z,
+    };
+
+    /// The rotation part of a model matrix, with the scale divided out.
+    ///
+    /// Scale is deliberately dropped: it belongs to the shape's extents, which
+    /// `Shape::transformed` handles. Leaving it in the basis would scale the
+    /// geometry twice.
+    pub fn from_matrix(m: &Mat4) -> Self {
+        let col = |i: usize| Vec3::new(m.m[i * 4], m.m[i * 4 + 1], m.m[i * 4 + 2]);
+        let normalize_or = |v: Vec3, fallback: Vec3| {
+            if v.length_squared() > 1e-12 {
+                v.normalize()
+            } else {
+                fallback
+            }
+        };
+        Self {
+            x: normalize_or(col(0), Vec3::UNIT_X),
+            y: normalize_or(col(1), Vec3::UNIT_Y),
+            z: normalize_or(col(2), Vec3::UNIT_Z),
+        }
+    }
+
+    /// One of the three axes, by index. Out-of-range indices give Z rather than
+    /// panicking, because the callers are loops over `0..3`.
+    pub fn axis(&self, index: usize) -> Vec3 {
+        match index {
+            0 => self.x,
+            1 => self.y,
+            _ => self.z,
+        }
+    }
+
+    /// Rotate a world-space vector into the shape's local frame.
+    pub fn to_local(&self, v: Vec3) -> Vec3 {
+        // Transpose of an orthonormal matrix is its inverse, so this is a
+        // dot product against each column.
+        Vec3::new(v.dot(self.x), v.dot(self.y), v.dot(self.z))
+    }
+
+    /// Rotate a local-space vector into world space.
+    pub fn to_world(&self, v: Vec3) -> Vec3 {
+        self.x * v.x + self.y * v.y + self.z * v.z
+    }
+
+    /// Whether this is (numerically) the identity, so callers can skip the
+    /// rotation work entirely for the common unrotated case.
+    pub fn is_identity(&self) -> bool {
+        (self.x - Vec3::UNIT_X).length_squared() < 1e-12
+            && (self.y - Vec3::UNIT_Y).length_squared() < 1e-12
+            && (self.z - Vec3::UNIT_Z).length_squared() < 1e-12
+    }
+}
+
+impl Default for Basis {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+/// A shape positioned and oriented in world space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldShape {
     /// World-space origin: the centre for spheres and boxes, a point on the
@@ -90,14 +175,32 @@ pub struct WorldShape {
     pub origin: Vec3,
     /// The shape itself, with world-space extents.
     pub shape: Shape,
+    /// Orientation. A box with a non-identity basis is an oriented box (OBB);
+    /// a sphere ignores it.
+    pub basis: Basis,
 }
 
 impl WorldShape {
+    /// An unrotated shape at `origin`.
     pub fn new(origin: Vec3, shape: Shape) -> Self {
-        Self { origin, shape }
+        Self {
+            origin,
+            shape,
+            basis: Basis::IDENTITY,
+        }
     }
 
-    /// Conservative world-space bounding radius around `origin`.
+    /// A shape with an explicit orientation.
+    pub fn oriented(origin: Vec3, shape: Shape, basis: Basis) -> Self {
+        Self {
+            origin,
+            shape,
+            basis,
+        }
+    }
+
+    /// Conservative world-space bounding radius around `origin`. Rotation does
+    /// not change it, which is exactly why it is the right early rejection test.
     pub fn bounding_radius(&self) -> f32 {
         self.shape.bounding_radius()
     }

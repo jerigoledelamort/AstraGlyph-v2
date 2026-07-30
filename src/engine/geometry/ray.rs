@@ -6,7 +6,7 @@
 // the player somewhere other than where the mirror shows them, and that class of
 // bug is invisible in both features' own tests.
 
-use crate::engine::geometry::shapes::{Shape, WorldShape};
+use crate::engine::geometry::shapes::{Basis, Shape, WorldShape};
 use crate::engine::math::Vec3;
 
 /// A ray with a unit direction.
@@ -70,7 +70,7 @@ pub fn intersect(ray: &Ray, shape: &WorldShape, t_min: f32, t_max: f32) -> Optio
             intersect_plane(ray, shape.origin, normal, half_size, t_min, t_max)
         }
         Shape::Box { half_extents } => {
-            intersect_box(ray, shape.origin, half_extents, t_min, t_max)
+            intersect_obb(ray, shape.origin, half_extents, &shape.basis, t_min, t_max)
         }
     }
 }
@@ -205,6 +205,38 @@ pub fn intersect_box(
     };
     outward = outward + axis_vector(axis) * sign;
     Some(oriented_hit(ray, t, point, outward))
+}
+
+/// Ray/oriented-box intersection.
+///
+/// The ray is rotated into the box's local frame, where the box *is* axis
+/// aligned, and the resulting hit is rotated back out. Doing it this way means
+/// there is one slab implementation rather than two that can disagree — the
+/// axis-aligned case is just this one with an identity basis, and it short-cuts
+/// to `intersect_box` so the common case pays nothing for the generality.
+pub fn intersect_obb(
+    ray: &Ray,
+    center: Vec3,
+    half_extents: Vec3,
+    basis: &Basis,
+    t_min: f32,
+    t_max: f32,
+) -> Option<RayHit> {
+    if basis.is_identity() {
+        return intersect_box(ray, center, half_extents, t_min, t_max);
+    }
+    // Local frame: the box sits at the origin, axis aligned.
+    let local_origin = basis.to_local(ray.origin - center);
+    let local_dir = basis.to_local(ray.direction());
+    let local_ray = Ray::new(local_origin, local_dir);
+    // `t` is preserved by a rotation, so the distance needs no correction.
+    let hit = intersect_box(&local_ray, Vec3::ZERO, half_extents, t_min, t_max)?;
+    Some(RayHit {
+        t: hit.t,
+        point: center + basis.to_world(hit.point),
+        normal: basis.to_world(hit.normal),
+        front_face: hit.front_face,
+    })
 }
 
 /// Ray/triangle intersection (Möller–Trumbore).
@@ -450,6 +482,77 @@ mod tests {
                 hit.normal
             );
         }
+    }
+
+    /// A rotated box must be hit where it actually is. Before `Basis` existed the
+    /// rotation was silently dropped, which is invisible in an axis-aligned test.
+    #[test]
+    fn rotated_box_is_hit_on_its_rotated_face() {
+        let basis = Basis::from_matrix(&crate::engine::math::Mat4::rotation_y(
+            std::f32::consts::FRAC_PI_4,
+        ));
+        let long_box = Shape::Box {
+            half_extents: Vec3::new(3.0, 0.5, 0.5),
+        };
+        let rotated = WorldShape::oriented(Vec3::ZERO, long_box, basis);
+        let axis_aligned = WorldShape::new(Vec3::ZERO, long_box);
+
+        // The box is 6 long in x and 1 thick in z. Unrotated, nothing of it
+        // reaches z = 2. Rotated 45 degrees about Y, its long axis swings out to
+        // z ~= 2.47, so a ray travelling along -X at z = 2 now passes through it.
+        let ray = Ray::new(Vec3::new(6.0, 0.0, 2.0), -Vec3::UNIT_X);
+        assert!(
+            intersect(&ray, &rotated, 0.001, T_MAX).is_some(),
+            "the rotated box should be in the ray's path"
+        );
+        assert!(
+            intersect(&ray, &axis_aligned, 0.001, T_MAX).is_none(),
+            "the unrotated box should not be — otherwise the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn identity_basis_matches_the_axis_aligned_path_exactly() {
+        let shape = Shape::Box {
+            half_extents: Vec3::new(1.0, 2.0, 0.5),
+        };
+        let ray = Ray::new(Vec3::new(0.3, 0.4, 5.0), -Vec3::UNIT_Z);
+        let plain = intersect_box(&ray, Vec3::ZERO, Vec3::new(1.0, 2.0, 0.5), 0.001, T_MAX).unwrap();
+        let via_obb = intersect(
+            &ray,
+            &WorldShape::new(Vec3::ZERO, shape),
+            0.001,
+            T_MAX,
+        )
+        .unwrap();
+        assert!((plain.t - via_obb.t).abs() < 1e-6);
+        assert!((plain.normal - via_obb.normal).length() < 1e-6);
+    }
+
+    /// A 90-degree rotation must move the reported normal with the face.
+    #[test]
+    fn rotated_box_normal_comes_back_in_world_space() {
+        let basis = Basis::from_matrix(&crate::engine::math::Mat4::rotation_y(
+            std::f32::consts::FRAC_PI_2,
+        ));
+        let shape = WorldShape::oriented(
+            Vec3::ZERO,
+            Shape::Box {
+                half_extents: Vec3::new(1.0, 1.0, 2.0),
+            },
+            basis,
+        );
+        // After a quarter turn about Y the local +Z face points along world -X
+        // (or +X), so a ray from +X must come back with a normal along +X.
+        let ray = Ray::new(Vec3::new(6.0, 0.0, 0.0), -Vec3::UNIT_X);
+        let hit = intersect(&ray, &shape, 0.001, T_MAX).expect("should hit");
+        assert!(
+            (hit.normal - Vec3::UNIT_X).length() < 1e-4,
+            "normal = {}",
+            hit.normal
+        );
+        // The long axis is now along X, so the hit is 2 units from the centre.
+        assert!((hit.t - 4.0).abs() < 1e-4, "t = {}", hit.t);
     }
 
     #[test]

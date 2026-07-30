@@ -16,6 +16,7 @@ use crate::scene::{
     MaterialComponent, MaterialRegistry, MeshComponent, Projection, Scene, TransformComponent,
 };
 use crate::demo::material_spheres;
+use crate::physics::{ray_through_grid_cell, BodyId, PhysicsWorld, RigidBody};
 use crate::ui::{Console, ConsoleAction, Menu, MenuAction, MenuEvent, MenuItem};
 
 use super::input::InputState;
@@ -166,6 +167,19 @@ fn seed_rig_from_camera(camera: &Camera) -> CameraRig {
 /// grid on each axis, giving every cell a 2x2 block of subpixels.
 const SUBSAMPLE: u32 = 2;
 
+/// What the last gameplay raycast found.
+#[derive(Clone, Copy, Debug)]
+struct PickResult {
+    /// The entity the ray hit, if the body could be mapped back to one.
+    entity: Option<Entity>,
+    /// Distance along the ray.
+    distance: f32,
+    /// World-space hit point.
+    point: Vec3,
+    /// Whether the line from the camera to the hit point is unobstructed.
+    visible: bool,
+}
+
 /// Which lighting path produces a frame.
 ///
 /// Three states rather than a boolean because "traced" is two different
@@ -202,6 +216,7 @@ fn build_menu() -> Menu {
                 vec!["True".into(), "256".into(), "16".into(), "Grey".into(), "Mono".into()],
                 0,
             ),
+            MenuItem::toggle("Physics", "phys", false),
             MenuItem::toggle("Ray tracing", "trace", false),
             MenuItem::toggle("Post FX", "post", false),
             MenuItem::toggle("Dynamic grid", "grid", false),
@@ -290,6 +305,22 @@ pub struct AppState {
     trace_key_was_down: bool,
     /// Frames rendered since startup.
     frame_counter: u32,
+    /// Rigid-body simulation. Populated from the scene's colliders on first use
+    /// and stepped only while enabled, so the default experience is unchanged and
+    /// the physics is a thing you switch on and watch.
+    physics: PhysicsWorld,
+    /// Which entity each physics body drives, so the step's results can be
+    /// written back into the transforms the renderer reads.
+    physics_bodies: Vec<(Entity, BodyId)>,
+    /// Whether the simulation is running. Off by default: the demo scene is
+    /// arranged for looking at materials, and dropping everything on the floor
+    /// the moment the engine starts would destroy that arrangement.
+    physics_enabled: bool,
+    physics_key_was_down: bool,
+    /// Last raycast result, drawn in the HUD. This is the visible half of
+    /// gameplay raycasting — a raycast with no output is unverifiable.
+    last_pick: Option<PickResult>,
+    pick_key_was_down: bool,
     composite_pipeline: CompositePipeline,
     ascii_processor: AsciiProcessor,
     camera: Camera,
@@ -454,6 +485,12 @@ impl AppState {
             ray_tracer,
             cpu_tracer,
             cpu_scene: CpuScene::default(),
+            physics: PhysicsWorld::new(),
+            physics_bodies: Vec::new(),
+            physics_enabled: false,
+            physics_key_was_down: false,
+            last_pick: None,
+            pick_key_was_down: false,
             trace_settings: TraceSettings::default(),
             traced_enabled,
             trace_key_was_down: false,
@@ -680,6 +717,27 @@ impl AppState {
             eprintln!("glyphs: style = {:?}", self.glyph_style);
         }
         self.style_key_was_down = style_key_down;
+
+        // F runs the rigid-body simulation (edge-triggered), and X casts a
+        // gameplay ray through the crosshair.
+        let physics_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyF);
+        if physics_key_down && !self.physics_key_was_down {
+            self.toggle_physics();
+        }
+        self.physics_key_was_down = physics_key_down;
+
+        let pick_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::KeyX);
+        if pick_key_down && !self.pick_key_was_down {
+            self.pick_under_crosshair();
+        }
+        self.pick_key_was_down = pick_key_down;
+
+        if self.physics_enabled {
+            self.step_physics(dt);
+        }
+
 
         // R switches between rasterised and traced lighting. This is the A/B
         // comparison the phase requires: without it there is no way to tell a
@@ -992,6 +1050,187 @@ impl AppState {
         self.metrics.fps()
     }
 
+    /// Build the physics world from the scene's colliders, once.
+    ///
+    /// Deferred rather than done at construction because it needs the composed
+    /// world matrices, which only exist after a frame has walked the hierarchy —
+    /// and because a simulation nobody asked for should not be paying for itself.
+    fn build_physics(&mut self) {
+        self.physics = PhysicsWorld::new();
+        self.physics_bodies.clear();
+
+        let entities = self.scene.entities_with::<MeshComponent>().to_vec();
+        let scene_ref = &self.scene;
+        let local_of = |e: Entity| {
+            scene_ref
+                .get_component::<TransformComponent>(e)
+                .map(|t| t.world_matrix())
+                .unwrap_or(Mat4::IDENTITY)
+        };
+        let world_matrices = self.hierarchy.world_matrices(&entities, &local_of);
+
+        for (entity, model) in world_matrices {
+            let Some(collider) = self.scene.get_component::<ColliderComponent>(entity) else {
+                continue;
+            };
+            let world = collider.shape.transformed(&model);
+            // A plane is the ground: immovable by construction, since there is
+            // nothing sensible for a falling floor to land on.
+            let body = if matches!(world.shape, crate::engine::geometry::Shape::Plane { .. }) {
+                RigidBody::immovable(world.origin, world.shape)
+            } else {
+                // Mass from volume at unit density, so a big sphere pushes a small
+                // one around rather than the reverse. A flat 1 kg for everything
+                // would make the demo's 1.8-radius glass sphere as easy to shove
+                // as its 0.45-radius satellite.
+                let r = world.bounding_radius().max(0.05);
+                let mass = 4.0 / 3.0 * std::f32::consts::PI * r * r * r;
+                RigidBody::dynamic(world.origin, world.shape, mass)
+            };
+            let id = self.physics.add(body);
+            self.physics_bodies.push((entity, id));
+        }
+        eprintln!(
+            "physics: {} bodies ({} dynamic)",
+            self.physics.len(),
+            self.physics.bodies().iter().filter(|b| b.is_movable()).count()
+        );
+    }
+
+    /// Step the simulation and write the results back into the scene transforms.
+    ///
+    /// Physics owns positions while it runs; the transforms are the renderer's
+    /// view of them. Writing back rather than having the renderer read the bodies
+    /// keeps the render path unchanged whether physics is on or off.
+    ///
+    /// The conversion is the subtle part. Physics works in world space, but
+    /// `TransformComponent::local` is relative to the entity's *parent* — and the
+    /// demo scene has a child (the satellite of the mirror sphere). Assigning a
+    /// world position straight into a child's local slot re-applies the parent's
+    /// transform on top of it, so the body drifts by the parent's offset every
+    /// frame and accelerates away. So the parent's world matrix is inverted and
+    /// the world position brought back into the parent's frame first.
+    fn step_physics(&mut self, dt: f32) {
+        // A long frame is clamped here as well as inside the world: the world's
+        // substep cap bounds the work, and this bounds how much simulated time a
+        // single stalled frame is allowed to claim.
+        self.physics.step(dt.min(0.1));
+
+        // Parent world matrices, resolved before any write so the whole batch
+        // uses one consistent view of the hierarchy. Writing and re-reading
+        // inside the loop would make a child's frame depend on whether its parent
+        // had already been updated this frame.
+        let updates: Vec<(Entity, Vec3)> = self
+            .physics_bodies
+            .iter()
+            .filter_map(|(entity, id)| {
+                let body = self.physics.body(*id)?;
+                if !body.is_movable() {
+                    return None;
+                }
+                Some((*entity, body.position))
+            })
+            .collect();
+
+        let entities: Vec<Entity> = updates.iter().map(|(e, _)| *e).collect();
+        let scene_ref = &self.scene;
+        let local_of = |e: Entity| {
+            scene_ref
+                .get_component::<TransformComponent>(e)
+                .map(|t| t.world_matrix())
+                .unwrap_or(Mat4::IDENTITY)
+        };
+        let parent_worlds: Vec<Option<Mat4>> = entities
+            .iter()
+            .map(|e| {
+                let parent = self.hierarchy.parent(*e)?;
+                let matrices = self.hierarchy.world_matrices(&[parent], &local_of);
+                matrices.into_iter().find(|(p, _)| *p == parent).map(|(_, m)| m)
+            })
+            .collect();
+
+        for ((entity, world_position), parent_world) in updates.into_iter().zip(parent_worlds) {
+            let local_position = match parent_world {
+                // A singular parent transform (zero scale on an axis) has no
+                // inverse. Skipping the write leaves the body where the scene put
+                // it rather than teleporting it to an arbitrary place.
+                Some(parent) => match parent.inverse_affine() {
+                    Some(inverse) => inverse.transform_point(world_position),
+                    None => continue,
+                },
+                None => world_position,
+            };
+            if let Some(transform) = self.scene.get_component_mut::<TransformComponent>(entity) {
+                // Only the position is written. Rotation and scale belong to the
+                // scene, and this simulation has no angular state to offer
+                // (see physics/body.rs).
+                transform.local.position = local_position;
+            }
+        }
+    }
+
+    /// Turn the simulation on or off, building it on first use.
+    fn toggle_physics(&mut self) {
+        self.physics_enabled = !self.physics_enabled;
+        if self.physics_enabled && self.physics.is_empty() {
+            self.build_physics();
+        }
+        eprintln!(
+            "physics: simulation {}",
+            if self.physics_enabled { "ON" } else { "OFF" }
+        );
+    }
+
+    /// Cast a ray through the centre of the grid and record what it hit.
+    ///
+    /// The crosshair rather than the mouse cursor: the pointer is in window
+    /// pixels, the scene is in grid cells, and the mapping between them is the
+    /// composite pass's letterboxing — a conversion worth having, but not one to
+    /// invent inside a picking query.
+    fn pick_under_crosshair(&mut self) {
+        if self.physics.is_empty() {
+            self.build_physics();
+        }
+        let ray = ray_through_grid_cell(
+            &self.camera,
+            self.grid_cols / 2,
+            self.grid_rows / 2,
+            self.grid_cols,
+            self.grid_rows,
+        );
+        match self.physics.raycast(&ray, 0.01, 1000.0) {
+            Some(found) => {
+                let entity = self
+                    .physics_bodies
+                    .iter()
+                    .find(|(_, id)| *id == found.body)
+                    .map(|(e, _)| *e);
+                // Line of sight from the camera to the hit point, which is a
+                // different question from "did the ray hit": the ray stops at the
+                // first surface, this asks whether anything is in between.
+                let visible = self.physics.line_of_sight(self.camera.position, found.hit.point);
+                let result = PickResult {
+                    entity,
+                    distance: found.hit.t,
+                    point: found.hit.point,
+                    visible,
+                };
+                eprintln!(
+                    "pick: entity {:?} at {:.2} units, point {}, line of sight {}",
+                    result.entity.map(|e| e.id()),
+                    result.distance,
+                    result.point,
+                    result.visible
+                );
+                self.last_pick = Some(result);
+            }
+            None => {
+                eprintln!("pick: nothing under the crosshair");
+                self.last_pick = None;
+            }
+        }
+    }
+
     /// Whether tracing can be switched on at all on this machine — by either
     /// implementation. There is always one: the CPU tracer exists precisely so
     /// the answer is never "no".
@@ -1200,6 +1439,7 @@ impl AppState {
         };
         self.menu.set_choice("style", style);
         self.menu.set_choice("color", color);
+        self.menu.set_toggle("phys", self.physics_enabled);
         self.menu.set_toggle("trace", self.traced_enabled);
         self.menu.set_toggle("post", self.post.any_enabled());
         self.menu.set_toggle("grid", self.subdivision.merges());
@@ -1220,13 +1460,19 @@ impl AppState {
                 _ => {}
             },
             MenuEvent::Toggled(id, on) => match id.as_str() {
+                "phys" => {
+                    if on != self.physics_enabled {
+                        self.toggle_physics();
+                    }
+                }
                 "trace" => {
                     if on != self.traced_enabled {
                         self.toggle_tracing();
                     }
                     // The menu may have moved ahead of reality (no ray query on
                     // this machine), so push the truth back into it.
-                    self.menu.set_toggle("trace", self.traced_enabled);
+                    self.menu.set_toggle("phys", self.physics_enabled);
+        self.menu.set_toggle("trace", self.traced_enabled);
                 }
                 "post" => {
                     self.post = if on {
@@ -1307,6 +1553,9 @@ impl AppState {
                 self.console
                     .print("  shadows|reflect|refract|ao [on|off]");
                 self.console.print("  samples <shadow|ao> <n>");
+                self.console.print("  phys [on|off]     rigid-body simulation");
+                self.console.print("  gravity <y>       gravity, m/s^2 (default -9.81)");
+                self.console.print("  pick              raycast through the crosshair");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -1457,6 +1706,37 @@ impl AppState {
                 }
                 _ => self.console.print_error("usage: depth <0-4>"),
             },
+            "phys" => {
+                let on = on_off(arg, self.physics_enabled);
+                if on != self.physics_enabled {
+                    self.toggle_physics();
+                }
+                self.console.print(format!(
+                    "phys: {} ({} bodies, {} contacts)",
+                    if self.physics_enabled { "on" } else { "off" },
+                    self.physics.len(),
+                    self.physics.contacts().len()
+                ));
+            }
+            "gravity" => match arg.and_then(|a| a.parse::<f32>().ok()) {
+                Some(y) if y.is_finite() && y.abs() <= 1000.0 => {
+                    self.physics.gravity = Vec3::new(0.0, y, 0.0);
+                    self.console.print(format!("gravity: {y} m/s^2"));
+                }
+                _ => self.console.print_error("usage: gravity <-1000..1000>"),
+            },
+            "pick" => {
+                self.pick_under_crosshair();
+                match &self.last_pick {
+                    Some(p) => self.console.print(format!(
+                        "hit entity {:?} at {:.2} units, {}",
+                        p.entity.map(|e| e.id()),
+                        p.distance,
+                        if p.visible { "visible" } else { "blocked" }
+                    )),
+                    None => self.console.print("nothing under the crosshair"),
+                }
+            }
             "clear" => {
                 self.console.handle(ConsoleAction::Clear);
             }
@@ -1532,6 +1812,34 @@ impl AppState {
             &format!("LIGHT {}", self.lighting_summary()),
             if self.traced_enabled { [0.5, 0.85, 1.0] } else { DIM },
         );
+        // Physics and the last pick. A raycast with no visible output cannot be
+        // verified by eye at all, so it gets a line of its own.
+        if self.physics_enabled || self.last_pick.is_some() {
+            let physics = if self.physics_enabled {
+                format!(
+                    "PHYS ON {} bodies {} contacts {} sub",
+                    self.physics.len(),
+                    self.physics.contacts().len(),
+                    self.physics.substeps()
+                )
+            } else {
+                "PHYS OFF".to_string()
+            };
+            self.overlay.draw_text(1, 7, &physics, DIM);
+            if let Some(pick) = &self.last_pick {
+                self.overlay.draw_text(
+                    1,
+                    8,
+                    &format!(
+                        "PICK {:.2}u {}",
+                        pick.distance,
+                        if pick.visible { "VISIBLE" } else { "BLOCKED" }
+                    ),
+                    [1.0, 0.9, 0.4],
+                );
+            }
+        }
+
         // Say plainly when a UI layer owns the keyboard. A frozen camera with no
         // explanation reads as a broken build, which is exactly how it was
         // reported — the state was correct, it just was not visible anywhere.
@@ -1539,13 +1847,13 @@ impl AppState {
             let owner = if self.console.is_open() { "CONSOLE" } else { "MENU" };
             self.overlay.draw_text(
                 1,
-                7,
+                9,
                 &format!("{owner} HAS FOCUS - ESC TO CLOSE"),
                 [1.0, 0.75, 0.3],
             );
         } else {
             self.overlay
-                .draw_text(1, 7, "TAB MENU  ` CONSOLE", DIM);
+                .draw_text(1, 9, "TAB MENU  ` CONSOLE", DIM);
         }
 
         // Crosshair at the centre of the grid.
@@ -1739,6 +2047,57 @@ mod tests {
     fn ui_starts_without_focus() {
         assert!(!build_menu().is_open(), "the menu must start closed");
         assert!(!build_console().is_open(), "the console must start closed");
+    }
+
+    /// Physics works in world space; `TransformComponent::local` is relative to
+    /// the parent. Writing a world position straight into a *child's* local slot
+    /// re-applies the parent's transform on top of it, so the body drifts by the
+    /// parent's offset every frame and accelerates away.
+    ///
+    /// This is the bug the demo scene actually had — its satellite sphere is a
+    /// child of the mirror sphere — and it cost 0.05 of residual kinetic energy in
+    /// a scene that should have settled to nothing. Pinned here on the conversion
+    /// itself, because `step_physics` needs a GPU to reach.
+    #[test]
+    fn a_childs_world_position_must_be_converted_into_its_parents_frame() {
+        // The demo's actual arrangement: parent translated and scaled 1.5x.
+        let parent_world = Mat4::translation(2.2, -0.5, -2.0).mul(Mat4::scaling_uniform(1.5));
+        // Where physics says the child is, in world space.
+        let world_position = Vec3::new(2.2, 1.45, -2.0);
+
+        let inverse = parent_world
+            .inverse_affine()
+            .expect("a translate-and-scale transform is invertible");
+        let local = inverse.transform_point(world_position);
+
+        // Composing back through the parent must return the world position: that
+        // is the whole contract, and the naive version (local = world) fails it.
+        let round_tripped = parent_world.transform_point(local);
+        assert!(
+            (round_tripped - world_position).length() < 1e-4,
+            "converted local {local} does not compose back to {world_position}, got {round_tripped}"
+        );
+
+        // And the naive assignment really is wrong, by a margin that would be
+        // visible immediately — otherwise this test is guarding nothing.
+        let naive = parent_world.transform_point(world_position);
+        assert!(
+            (naive - world_position).length() > 1.0,
+            "the naive write-back should be off by more than a unit, was off by {}",
+            (naive - world_position).length()
+        );
+    }
+
+    /// An entity with no parent needs no conversion, and must not get one.
+    #[test]
+    fn a_root_entitys_world_position_is_already_local() {
+        let world_position = Vec3::new(1.0, 2.0, 3.0);
+        // No parent means identity, so local == world.
+        let local = Mat4::IDENTITY
+            .inverse_affine()
+            .unwrap()
+            .transform_point(world_position);
+        assert_eq!(local, world_position);
     }
 
     #[test]
