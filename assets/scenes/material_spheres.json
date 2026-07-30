@@ -64,7 +64,28 @@
         "type": "matte",
         "color": [0.85, 0.1, 0.1, 1.0],
         "ambient": 0.1,
-        "diffuse": 0.9
+        "diffuse": 0.9,
+        "texture": "assets/textures/checker.png"
+      }
+    },
+    {
+      "name": "checker_crate",
+      "comment": "textured box: each 2x2-unit face carries one repeat of checker.png (the same 2-units-per-tile density as the ground), rotated so perspective on the texture is visible",
+      "transform": {
+        "position": [4.8, -1.0, 1.5],
+        "rotation_degrees": [0.0, 25.0, 0.0]
+      },
+      "mesh": {
+        "type": "box",
+        "half_extents": [1.0, 1.0, 1.0],
+        "color": [1.0, 1.0, 1.0]
+      },
+      "material": {
+        "type": "matte",
+        "color": [1.0, 1.0, 1.0, 1.0],
+        "ambient": 0.12,
+        "diffuse": 0.88,
+        "texture": "assets/textures/checker.png"
       }
     },
     {

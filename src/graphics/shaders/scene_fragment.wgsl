@@ -16,7 +16,15 @@ fn main(input: VertexOutput) -> @location(0) vec4<f32> {
     let world_pos = input.world_pos;
 
     let mat = materials[input.material_index];
-    let albedo = mat.albedo.rgb;
+    // Sampled before any branching: textureSample requires uniform control
+    // flow, and the alpha-test discard below would break it if sampled later.
+    let surface = surface_color(mat, input.uv);
+    // Binary cutout, distinct from glass blending: below the threshold the
+    // fragment simply does not exist — no depth write, no shading cost.
+    if ((mat.flags & MATERIAL_FLAG_ALPHA_TEST) != 0u && surface.a < 0.5) {
+        discard;
+    }
+    let albedo = surface.rgb;
     let view_dir = normalize(camera.camera_pos - world_pos);
 
     var ambient_sum = mat.ambient;

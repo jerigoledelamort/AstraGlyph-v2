@@ -8,11 +8,8 @@ pub mod vec4;
 
 pub use mat4::Mat4;
 pub use transform::Transform;
-// `Vec2` has no caller since `ascii::cell_grid` was removed, but it is part of the
-// math library's surface and its own tests exercise it. Kept rather than deleted:
-// UI layout and texture coordinates will want it, and re-deriving it later would be
-// pure churn.
-#[allow(unused_imports)]
+// `Vec2` found its caller: texture coordinates (`MeshVertex::uv`), exactly the
+// use its keep-it comment predicted.
 pub use vec2::Vec2;
 pub use vec3::Vec3;
 pub use vec4::Vec4;

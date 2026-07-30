@@ -31,8 +31,9 @@ pub const MAX_MATERIALS: usize = 256;
 /// Number of 32-bit words in a material dedup key.
 ///
 /// 4 (albedo) + 1 (material_type) + 7 (ambient, diffuse, specular, shininess, ior,
-/// reflectivity, transparency) = 12 words, covering every field of `MaterialUniform`.
-const KEY_WORDS: usize = 12;
+/// reflectivity, transparency) + 1 (texture_index) + 1 (flags) + 2 (uv_scale)
+/// = 16 words, covering every field of `MaterialUniform`.
+const KEY_WORDS: usize = 16;
 
 /// Bitwise identity key for a `MaterialUniform`.
 ///
@@ -56,6 +57,11 @@ fn material_key(u: &MaterialUniform) -> MaterialKey {
         u.ior.to_bits(),
         u.reflectivity.to_bits(),
         u.transparency.to_bits(),
+        // Integer fields enter the key as-is.
+        u.texture_index,
+        u.flags,
+        u.uv_scale[0].to_bits(),
+        u.uv_scale[1].to_bits(),
     ]
 }
 
@@ -430,6 +436,23 @@ mod tests {
     }
 
     #[test]
+    fn texture_and_flags_participate_in_dedup() {
+        let mut reg = MaterialRegistry::new();
+        let plain = base();
+        let textured = base().with_texture(0);
+        let other_texture = base().with_texture(1);
+        let cutout = base().with_texture(0).with_alpha_test();
+
+        let ip = reg.register(&plain);
+        let it = reg.register(&textured);
+        let io = reg.register(&other_texture);
+        let ic = reg.register(&cutout);
+        assert_eq!(reg.len(), 4, "texture index and flags must each split a slot");
+        assert_eq!(reg.register(&textured), it, "and still dedup with themselves");
+        assert!(ip != it && it != io && io != ic);
+    }
+
+    #[test]
     fn positive_and_negative_zero_are_distinct() {
         // Bitwise keys mean signed zeros do not dedup, even though 0.0 == -0.0.
         let mut reg = MaterialRegistry::new();
@@ -503,6 +526,18 @@ mod tests {
         mutated.push(u);
         let mut u = uniform;
         u.transparency += 1.0;
+        mutated.push(u);
+        let mut u = uniform;
+        u.texture_index = 3;
+        mutated.push(u);
+        let mut u = uniform;
+        u.flags |= 1;
+        mutated.push(u);
+        let mut u = uniform;
+        u.uv_scale[0] += 0.5;
+        mutated.push(u);
+        let mut u = uniform;
+        u.uv_scale[1] += 0.5;
         mutated.push(u);
 
         assert_eq!(mutated.len(), KEY_WORDS);

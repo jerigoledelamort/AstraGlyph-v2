@@ -299,6 +299,67 @@ cores on the target hardware.
 
 ---
 
+## 🔧 Post-phase correctness pass (стадия 0 of the game-readiness plan)
+
+- [x] Normals under non-uniform scale: `ObjectUniform` carries the inverse-transpose
+      of the model's upper 3x3, computed once per object on the CPU (WGSL has no
+      inverse) and used by `scene_vertex.wgsl`. Stored as a mat4x4 rather than a
+      mat3x3 to keep the WGSL/Rust layouts trivially identical. Secondary traced
+      hits still rotate normals by the instance basis only — a `TracedInstance`
+      has no normal matrix yet, and stays a documented limitation until it does.
+      The CPU tracer was already exact: it intersects analytic shapes, whose
+      normals come from the equation, not from a transformed attribute
+- [x] JSON numbers outside f32 range are now a parse error with a byte offset,
+      rejected in the parser rather than at the accessor. Previously `1e300` made
+      `as_f32` return `None`, which optional-field code read as "absent" — the
+      scene loaded fine with a silently defaulted value and nothing pointed at
+      the actual mistake in the file
+- [x] Cornell Box rebuilt on transforms: geometry authored at the origin, placed
+      by `TransformComponent`, every entity carrying an analytic collider (bounded
+      planes for the walls, `Shape::Box` for the inner boxes). World-space result
+      pinned vertex-for-vertex by tests, because "visually identical" is the kind
+      of claim that rots. This makes the scene usable for physics and as the
+      golden-test reference (стадия 9)
+- [x] The editor saves a scene under its own name and to the file it was loaded
+      or hot-reloaded from, instead of hard-coding `material_spheres`
+
+---
+
+## 🎨 Stage 1: UV + texturing (game-readiness plan)
+
+- [x] Vertex format grew UVs: position + normal + colour + **uv**, 11 f32 / 44
+      bytes. Vertex colour kept as a fallback and tint. The ray tracer's geometry
+      heap stride and its WGSL mirror (`HEAP_STRIDE`) changed in the same commit,
+      pinned to `size_of::<MeshVertex>()` by test
+- [x] Primitive unwraps: sphere equirectangular (seam vertex carries u = 1.0, not
+      a wrap to 0), plane planar at 2 world units per repeat, and a new `box_mesh`
+      primitive with per-face unwrap at the same density — so one material tiles
+      identically on a floor and a crate. `"box"` joined the scene format (and
+      `MeshSource`), replacing the old "a box saves as its enclosing sphere" loss
+- [x] OBJ `vt` carried to vertices, v flipped once at the format boundary
+- [x] GPU texture storage: one `texture_2d_array` binding (`graphics/texture_array`),
+      chosen over an atlas because Repeat-tiling through an atlas needs wrap
+      arithmetic in the shader that breaks at mip transitions. All layers share the
+      max size; smaller textures are edge-padded and their UVs rescaled via a
+      per-material `uv_scale`. Mips are built on the CPU with a box filter —
+      at a 240x136 target, mip-0 sampling aliases into noise the glyph stage amplifies
+- [x] Materials: `texture_index` (sentinel `NO_TEXTURE`), `flags` (alpha-test),
+      `uv_scale`; registry key grew 12 → 16 words; loader collects and dedups
+      texture *paths*; writer writes paths (indices are load-order artifacts);
+      round-trip pinned by tests
+- [x] Rasterised path samples with `textureSample` (before the alpha-test
+      `discard`, for uniform control flow); traced path interpolates UVs from the
+      heap by the same barycentrics as normals and samples with
+      `textureSampleLevel(log2(distance))` — no screen derivatives exist on a ray
+- [x] Alpha-test: binary cutout, distinct from glass blending. Raster: `discard`.
+      Traced camera-facing hits: re-cast past transparent texels (budgeted,
+      4 skips). Traced *shadow* rays keep TERMINATE_ON_FIRST_HIT and treat
+      cutouts as opaque — documented limitation
+- [x] CPU fallback tracer does not sample textures (analytic shapes have no UVs);
+      textured materials render there in flat albedo. Documented rather than wired
+
+---
+
 ## 🏁 Victory Condition
 
 The roadmap is complete when:

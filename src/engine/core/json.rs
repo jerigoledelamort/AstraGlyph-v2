@@ -96,14 +96,14 @@ impl JsonValue {
 
     /// Numeric payload narrowed to `f32` (the engine's native float width).
     ///
-    /// Values outside `f32` range are rejected instead of narrowed: `1e300` is a perfectly
-    /// finite `f64`, but `as f32` turns it into `f32::INFINITY` — smuggling in exactly the
-    /// poison value the parser's own finiteness check exists to keep out. One infinity in a
-    /// position or scale makes every derived matrix `NaN`. Merely losing precision (`1e-300`
-    /// flushing to zero) is still fine, that is ordinary float behaviour.
+    /// The parser already rejects any literal that does not narrow to a finite `f32`
+    /// (with a byte offset, which this accessor could never provide), so for parsed
+    /// documents the check below never fires. It stays because `JsonValue` can also be
+    /// constructed by hand: a synthetic `Number(1e300)` or `Number(NaN)` must not smuggle
+    /// an infinity into a transform. Merely losing precision (`1e-300` flushing to zero)
+    /// is still fine, that is ordinary float behaviour.
     pub fn as_f32(&self) -> Option<f32> {
         let narrowed = self.as_f64()? as f32;
-        // Also catches a hand-constructed `Number(NaN)`, which the parser can never produce.
         if narrowed.is_finite() {
             Some(narrowed)
         } else {
@@ -569,10 +569,17 @@ impl<'a> Parser<'a> {
         // Slice boundaries are digits or ASCII punctuation, so this can never split a char.
         let text = &self.input[start..self.pos];
         match text.parse::<f64>() {
-            // Reject infinities: silently turning `1e999` into `inf` would poison every
-            // transform downstream and surface as an unexplained blank frame.
-            Ok(n) if n.is_finite() => Ok(JsonValue::Number(n)),
-            Ok(_) => self.error_at(start, "a number representable as a finite f64"),
+            // Reject values that are not representable as a *finite f32*, not just
+            // a finite f64. The engine's native float is f32, and every consumer
+            // narrows eventually; `1e300` is a perfectly finite f64 that `as f32`
+            // turns into infinity. Rejecting it here, with a byte offset, is the
+            // difference between "scene.json: parse error at byte offset 1042" and
+            // an optional field silently falling back to its default because the
+            // accessor returned `None` — the field did not "go missing", the file
+            // is wrong, and only the parser knows where. Losing precision (`1e-300`
+            // flushing to zero) stays accepted: that is ordinary float narrowing.
+            Ok(n) if (n as f32).is_finite() => Ok(JsonValue::Number(n)),
+            Ok(_) => self.error_at(start, "a number representable as a finite f32"),
             Err(_) => self.error_at(start, "a valid number"),
         }
     }
@@ -711,6 +718,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_numbers_outside_f32_range_at_parse_time() {
+        // Finite as f64, infinite as f32. Rejected by the *parser*, not the
+        // accessor, so a bad literal in a scene file fails with a byte offset
+        // instead of surfacing as "optional field silently used its default".
+        for input in ["1e300", "-1e300", "1e39", "3.5e38"] {
+            let message = err(input);
+            assert!(
+                message.contains("offset") && message.contains("f32"),
+                "`{input}` should be rejected with an offset and a reason: {message}"
+            );
+        }
+        // The offset must point at the number, not the start of the document.
+        let message = err(r#"{ "fov": 1e300 }"#);
+        assert!(message.contains("offset 9"), "wrong offset: {message}");
+    }
+
+    #[test]
     fn numeric_accessors_narrow_correctly() {
         assert_eq!(ok("1.5").as_f32(), Some(1.5f32));
         assert_eq!(ok("7").as_u32(), Some(7));
@@ -725,15 +749,25 @@ mod tests {
 
     #[test]
     fn as_f32_rejects_values_outside_f32_range() {
-        // These are finite `f64`s, so the parser accepts them — but narrowing them would
-        // produce an infinity, which is precisely what `rejects_non_finite_numbers` guards.
-        assert_eq!(ok("1e300").as_f32(), None);
-        assert_eq!(ok("-1e300").as_f32(), None);
-        assert_eq!(ok("1e39").as_f32(), None, "just past f32::MAX");
-        assert_eq!(ok("1e300").as_f64(), Some(1e300), "as_f64 still reports it faithfully");
+        // The parser now rejects these at parse time (see
+        // `rejects_numbers_outside_f32_range_at_parse_time`), so the only way such
+        // values reach the accessor is a hand-constructed document — which must
+        // still not smuggle an infinity through.
+        assert_eq!(JsonValue::Number(1e300).as_f32(), None);
+        assert_eq!(JsonValue::Number(-1e300).as_f32(), None);
+        assert_eq!(JsonValue::Number(f64::NAN).as_f32(), None);
+        assert_eq!(
+            JsonValue::Number(1e300).as_f64(),
+            Some(1e300),
+            "as_f64 still reports it faithfully"
+        );
         // The rejection propagates through the aggregate accessors a scene loader uses.
-        assert_eq!(ok("[1e300, 0, 0]").get_vec3_array(), None);
-        assert_eq!(ok(r#"{ "fov": 1e300 }"#).get_f32("fov"), None);
+        let vec = JsonValue::Array(vec![
+            JsonValue::Number(1e300),
+            JsonValue::Number(0.0),
+            JsonValue::Number(0.0),
+        ]);
+        assert_eq!(vec.get_vec3_array(), None);
 
         // Values that merely lose precision stay accepted.
         assert_eq!(ok("1e-300").as_f32(), Some(0.0), "underflow to zero is ordinary");

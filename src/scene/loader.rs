@@ -31,8 +31,8 @@ use crate::engine::math::{radians, Transform, Vec3, Vec4};
 use crate::renderer::LightUniform;
 use crate::engine::geometry::Shape;
 use crate::scene::{
-    plane, plane_shape, sphere, sphere_shape, Camera, ColliderComponent, Entity, Hierarchy,
-    MaterialComponent, MeshComponent, Projection, Scene, TransformComponent,
+    box_mesh, box_shape, plane, plane_shape, sphere, sphere_shape, Camera, ColliderComponent,
+    Entity, Hierarchy, MaterialComponent, MeshComponent, Projection, Scene, TransformComponent,
 };
 
 /// Everything a scene file describes: the entities, the camera to view them
@@ -51,6 +51,12 @@ pub struct LoadedScene {
     /// and an editor saving the scene back would otherwise have to guess. See
     /// `scene::writer::MeshSource`.
     pub mesh_sources: std::collections::HashMap<u64, crate::scene::MeshSource>,
+    /// Texture paths in `texture_index` order: a material with `texture_index == i`
+    /// samples the image loaded from `textures[i]`. Paths are deduplicated, so two
+    /// materials naming the same file share one array layer. Kept as paths rather
+    /// than decoded pixels because decoding needs the filesystem and the loader
+    /// must stay testable on in-memory strings.
+    pub textures: Vec<String>,
 }
 
 fn err(msg: impl Into<String>) -> EngineError {
@@ -80,10 +86,18 @@ pub fn parse_scene(source: &str) -> Result<LoadedScene> {
     let mut scene = Scene::new();
     let mut hierarchy = Hierarchy::new();
     let mut mesh_sources = std::collections::HashMap::new();
+    let mut textures = Vec::new();
     if let Some(entries) = root.get_array("entities") {
         for (i, entry) in entries.iter().enumerate() {
-            add_entity(&mut scene, &mut hierarchy, &mut mesh_sources, entry, None)
-                .map_err(|e| err(format!("scene: entities[{i}]: {e}")))?;
+            add_entity(
+                &mut scene,
+                &mut hierarchy,
+                &mut mesh_sources,
+                &mut textures,
+                entry,
+                None,
+            )
+            .map_err(|e| err(format!("scene: entities[{i}]: {e}")))?;
         }
     }
 
@@ -94,6 +108,7 @@ pub fn parse_scene(source: &str) -> Result<LoadedScene> {
         lights,
         hierarchy,
         mesh_sources,
+        textures,
     })
 }
 
@@ -196,6 +211,7 @@ fn add_entity(
     scene: &mut Scene,
     hierarchy: &mut Hierarchy,
     mesh_sources: &mut std::collections::HashMap<u64, crate::scene::MeshSource>,
+    textures: &mut Vec<String>,
     value: &json::JsonValue,
     parent: Option<Entity>,
 ) -> Result<()> {
@@ -205,7 +221,7 @@ fn add_entity(
     let (mesh, shape, mesh_source) = parse_mesh(mesh_value)?;
 
     let material = match value.get("material") {
-        Some(m) => parse_material(m)?,
+        Some(m) => parse_material(m, textures)?,
         None => MaterialComponent::default(),
     };
 
@@ -229,7 +245,7 @@ fn add_entity(
 
     if let Some(children) = value.get_array("children") {
         for (i, child) in children.iter().enumerate() {
-            add_entity(scene, hierarchy, mesh_sources, child, Some(entity))
+            add_entity(scene, hierarchy, mesh_sources, textures, child, Some(entity))
                 .map_err(|e| err(format!("children[{i}]: {e}")))?;
         }
     }
@@ -248,7 +264,7 @@ fn parse_mesh(
 ) -> Result<(MeshComponent, Shape, crate::scene::MeshSource)> {
     let kind = value
         .get_str("type")
-        .ok_or_else(|| err("mesh: missing \"type\" (\"plane\", \"sphere\" or \"obj\")"))?;
+        .ok_or_else(|| err("mesh: missing \"type\" (\"plane\", \"sphere\", \"box\" or \"obj\")"))?;
     let color = vec3_field(value, "color").unwrap_or(Vec3::ONE);
     // Geometry is authored at the origin; placement belongs to the transform.
     let center = Vec3::ZERO;
@@ -327,6 +343,24 @@ fn parse_mesh(
                 },
             ))
         }
+        // An axis-aligned box authored by half-extents, the same convention as
+        // `Shape::Box`. Added with texturing: a box was pointless while the only
+        // way to spell one was baked Cornell geometry, but a textured crate is
+        // the archetypal game prop.
+        "box" => {
+            let half = value
+                .get_vec3("half_extents")
+                .map(|h| Vec3::new(h[0], h[1], h[2]))
+                .unwrap_or(Vec3::new(0.5, 0.5, 0.5));
+            if half.x <= 0.0 || half.y <= 0.0 || half.z <= 0.0 {
+                return Err(err("box mesh: \"half_extents\" must be positive on every axis"));
+            }
+            Ok((
+                box_mesh(half, color),
+                box_shape(half),
+                crate::scene::MeshSource::Box { half_extents: half },
+            ))
+        }
         "sphere" => {
             let radius = value.get_f32("radius").unwrap_or(1.0);
             if radius <= 0.0 {
@@ -345,12 +379,15 @@ fn parse_mesh(
             ))
         }
         other => Err(err(format!(
-            "mesh: unknown type {other:?} (expected \"plane\", \"sphere\" or \"obj\")"
+            "mesh: unknown type {other:?} (expected \"plane\", \"sphere\", \"box\" or \"obj\")"
         ))),
     }
 }
 
-fn parse_material(value: &json::JsonValue) -> Result<MaterialComponent> {
+fn parse_material(
+    value: &json::JsonValue,
+    textures: &mut Vec<String>,
+) -> Result<MaterialComponent> {
     let kind = value.get_str("type").unwrap_or("matte");
     let color = value
         .get_vec4("color")
@@ -358,25 +395,53 @@ fn parse_material(value: &json::JsonValue) -> Result<MaterialComponent> {
         .or_else(|| value.get_vec3("color").map(|c| Vec4::new(c[0], c[1], c[2], 1.0)))
         .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
 
-    match kind {
+    let mut material = match kind {
         "matte" => {
             let ambient = value.get_f32("ambient").unwrap_or(0.1);
             let diffuse = value.get_f32("diffuse").unwrap_or(0.9);
-            Ok(MaterialComponent::matte(color, ambient, diffuse))
+            MaterialComponent::matte(color, ambient, diffuse)
         }
         "mirror" => {
             let reflectivity = value.get_f32("reflectivity").unwrap_or(0.8);
-            Ok(MaterialComponent::mirror(color, reflectivity))
+            MaterialComponent::mirror(color, reflectivity)
         }
         "glass" => {
             let ior = value.get_f32("ior").unwrap_or(1.5);
             let transparency = value.get_f32("transparency").unwrap_or(0.8);
-            Ok(MaterialComponent::glass(color, ior, transparency))
+            MaterialComponent::glass(color, ior, transparency)
         }
-        other => Err(err(format!(
-            "material: unknown type {other:?} (expected \"matte\", \"mirror\" or \"glass\")"
-        ))),
+        other => {
+            return Err(err(format!(
+                "material: unknown type {other:?} (expected \"matte\", \"mirror\" or \"glass\")"
+            )))
+        }
+    };
+
+    // Optional texture: any material type may carry one; the albedo colour
+    // becomes a multiplier over the sampled texel. Paths dedup by string
+    // identity — "a/b.png" and "./a/b.png" would occupy two layers, which
+    // costs memory but is never wrong.
+    if let Some(path) = value.get_str("texture") {
+        if path.is_empty() {
+            return Err(err("material: \"texture\" must not be empty"));
+        }
+        let index = match textures.iter().position(|t| t == path) {
+            Some(existing) => existing as u32,
+            None => {
+                textures.push(path.to_string());
+                (textures.len() - 1) as u32
+            }
+        };
+        material = material.with_texture(index);
     }
+    // Alpha test is meaningful with a texture (the cutout comes from texel
+    // alpha), but is accepted without one so a material can be authored before
+    // its texture exists; an untextured alpha-test material is fully opaque.
+    if value.get_bool("alpha_test").unwrap_or(false) {
+        material = material.with_alpha_test();
+    }
+
+    Ok(material)
 }
 
 /// Transforms are fully optional: any missing channel keeps its identity value.
@@ -674,6 +739,81 @@ mod tests {
     }
 
     #[test]
+    fn textures_are_collected_and_deduplicated_by_path() {
+        let src = r#"{
+            "camera": { "position": [0,0,1], "target": [0,0,0] },
+            "entities": [
+                { "mesh": { "type": "sphere" },
+                  "material": { "type": "matte", "texture": "assets/textures/checker.png" } },
+                { "mesh": { "type": "sphere" },
+                  "material": { "type": "mirror", "texture": "assets/textures/checker.png" } },
+                { "mesh": { "type": "plane", "size": 4 },
+                  "material": { "type": "matte", "texture": "assets/textures/bricks.png",
+                                "alpha_test": true } },
+                { "mesh": { "type": "sphere" },
+                  "material": { "type": "matte" } }
+            ]
+        }"#;
+        let loaded = parse_scene(src).unwrap();
+        assert_eq!(
+            loaded.textures,
+            vec![
+                "assets/textures/checker.png".to_string(),
+                "assets/textures/bricks.png".to_string()
+            ],
+            "two distinct paths, the shared one deduplicated"
+        );
+        let materials: Vec<MaterialComponent> = loaded
+            .scene
+            .all_entities()
+            .iter()
+            .filter_map(|e| loaded.scene.get_component::<MaterialComponent>(*e))
+            .copied()
+            .collect();
+        let with_texture: Vec<u32> = materials
+            .iter()
+            .filter(|m| m.has_texture())
+            .map(|m| m.texture_index)
+            .collect();
+        assert_eq!(with_texture.len(), 3);
+        assert!(with_texture.contains(&0) && with_texture.contains(&1));
+        let cutout = materials
+            .iter()
+            .find(|m| m.flags & crate::scene::component::material_flags::ALPHA_TEST != 0)
+            .expect("the alpha_test material must carry its flag");
+        assert_eq!(cutout.texture_index, 1);
+        // The untextured material keeps the sentinel.
+        assert!(materials.iter().any(|m| !m.has_texture()));
+    }
+
+    #[test]
+    fn an_empty_texture_path_is_an_error() {
+        let src = r#"{
+            "camera": { "position": [0,0,1], "target": [0,0,0] },
+            "entities": [ { "mesh": { "type": "sphere" },
+                            "material": { "type": "matte", "texture": "" } } ]
+        }"#;
+        assert!(parse_scene(src).is_err());
+    }
+
+    #[test]
+    fn out_of_f32_range_numbers_are_a_parse_error_with_an_offset() {
+        // Before стадия 0.2 this loaded successfully: `1e300` narrowed to None in
+        // as_f32, the optional "fov_y_degrees" quietly fell back to 60 degrees,
+        // and the file's actual mistake never surfaced. Now the parser rejects
+        // the literal itself, pointing at the byte.
+        let src = r#"{
+            "camera": { "position": [0, 1, 5], "target": [0, 0, 0],
+                        "projection": { "type": "perspective", "fov_y_degrees": 1e300 } },
+            "entities": [ { "mesh": { "type": "sphere" } } ]
+        }"#;
+        let e = expect_err(parse_scene(src));
+        let msg = format!("{e}");
+        assert!(msg.contains("offset"), "error should carry a byte offset: {msg}");
+        assert!(msg.contains("f32"), "error should explain the range problem: {msg}");
+    }
+
+    #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(parse_scene("").is_err());
         assert!(parse_scene("{").is_err());
@@ -703,8 +843,13 @@ mod tests {
         assert_eq!(loaded.lights.len(), 2);
         assert_eq!(
             loaded.scene.entities_with::<MeshComponent>().len(),
-            6,
-            "ground, three spheres, the blue sphere's satellite child, and the OBJ pyramid"
+            7,
+            "ground, three spheres, the satellite child, the OBJ pyramid, and the checker crate"
+        );
+        assert_eq!(
+            loaded.textures,
+            vec!["assets/textures/checker.png".to_string()],
+            "the red sphere and the crate share one texture layer"
         );
         // The pyramid comes from an external file, so this also proves the "obj" mesh
         // type resolves and parses through the real scene path — a broken model file

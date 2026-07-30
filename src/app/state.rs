@@ -257,13 +257,14 @@ fn build_console() -> Console {
 /// the crate root (so it also works when launched from elsewhere).
 const STARTUP_SCENE: &str = "assets/scenes/material_spheres.json";
 
-/// A decoded texture, reduced to what the engine can currently use.
+/// A decoded texture, reduced to a diagnostic summary.
 ///
-/// The full pixel buffer is *not* kept: a 4K RGBA image is 64 MiB, and nothing here
-/// samples it yet. Holding megabytes to report a size would be a memory leak dressed
-/// as a feature. What is kept is the metadata plus the average colour — the one value
-/// an ASCII renderer could plausibly take from a texture, and computing it touches
-/// every pixel, so the decode is genuinely exercised rather than merely invoked.
+/// This is the *watcher's* view of `assets/textures`, predating real texturing
+/// and kept for the console/profiler report. The pixels the renderer actually
+/// samples take a different route: `scene_textures` (paths from the scene file)
+/// -> `apply_scene_textures` -> the GPU texture array. The full pixel buffer is
+/// not kept here — holding megabytes to report a size would be a memory leak
+/// dressed as a feature.
 struct Texture {
     name: String,
     width: u32,
@@ -332,13 +333,7 @@ fn script_paths() -> Vec<std::path::PathBuf> {
 /// if the file is missing or malformed. The fallback keeps the engine runnable
 /// while a scene file is being edited; which path was taken is logged so a
 /// silent fallback can't be mistaken for a successful load.
-fn load_startup_scene() -> (
-    Scene,
-    Camera,
-    Vec<LightUniform>,
-    Hierarchy,
-    std::collections::HashMap<u64, crate::scene::MeshSource>,
-) {
+fn load_startup_scene() -> crate::scene::LoadedScene {
     let candidates = scene_paths();
 
     for path in &candidates {
@@ -348,18 +343,13 @@ fn load_startup_scene() -> (
         match crate::scene::load_scene_file(path) {
             Ok(loaded) => {
                 eprintln!(
-                    "scene: loaded \"{}\" from {} ({} lights)",
+                    "scene: loaded \"{}\" from {} ({} lights, {} textures)",
                     loaded.name,
                     path.display(),
-                    loaded.lights.len()
+                    loaded.lights.len(),
+                    loaded.textures.len()
                 );
-                return (
-                    loaded.scene,
-                    loaded.camera,
-                    loaded.lights,
-                    loaded.hierarchy,
-                    loaded.mesh_sources,
-                );
+                return loaded;
             }
             Err(e) => eprintln!("scene: failed to load {}: {e}", path.display()),
         }
@@ -369,13 +359,15 @@ fn load_startup_scene() -> (
     let (scene, camera) = material_spheres::build_scene();
     // The code-built demo has no recorded descriptors; the writer falls back to
     // inferring them from colliders, which is the editor-created-entity path.
-    (
+    crate::scene::LoadedScene {
+        name: String::from("material_spheres"),
         scene,
         camera,
-        material_spheres::lights(),
-        Hierarchy::new(),
-        std::collections::HashMap::new(),
-    )
+        lights: material_spheres::lights(),
+        hierarchy: Hierarchy::new(),
+        mesh_sources: std::collections::HashMap::new(),
+        textures: Vec::new(),
+    }
 }
 
 /// Main application state.
@@ -420,6 +412,14 @@ pub struct AppState {
     mesh_sources: std::collections::HashMap<u64, crate::scene::MeshSource>,
     /// Where the scene came from, so the editor knows where to save it back.
     scene_path: Option<std::path::PathBuf>,
+    /// The loaded scene's "name" field, written back on save. Without this,
+    /// every scene saved from the editor was renamed "material_spheres" —
+    /// the name of the startup demo, hard-coded where this field is now used.
+    scene_name: String,
+    /// Texture paths in `texture_index` order (see `LoadedScene::textures`).
+    /// Needed both to build the GPU texture array and to write paths (not
+    /// load-order indices) back out on save.
+    scene_textures: Vec<String>,
     /// Real per-pass GPU timings from timestamp queries, replacing the wall-clock
     /// estimate `FrameMetrics` has always reported. Disabled on adapters without
     /// `TIMESTAMP_QUERY`, in which case it says so rather than reporting zeros.
@@ -603,6 +603,7 @@ impl AppState {
         let scene_format = wgpu::TextureFormat::Rgba8Unorm;
         let scene_pipeline = ScenePipeline::new(
             &graphics.device,
+            &graphics.queue,
             sub_cols,
             sub_rows,
             scene_format,
@@ -624,7 +625,16 @@ impl AppState {
             sub_rows,
         );
 
-        let (scene, camera, lights, hierarchy, mesh_sources) = load_startup_scene();
+        let loaded = load_startup_scene();
+        let (scene, camera, lights, hierarchy, mesh_sources, scene_name, scene_textures) = (
+            loaded.scene,
+            loaded.camera,
+            loaded.lights,
+            loaded.hierarchy,
+            loaded.mesh_sources,
+            loaded.name,
+            loaded.textures,
+        );
 
         let camera_rig = seed_rig_from_camera(&camera);
 
@@ -745,7 +755,7 @@ impl AppState {
         let traced_enabled = (ray_tracer.is_some() && scene_pipeline.supports_tracing())
             || cpu_tracer.is_some();
 
-        Ok(Self {
+        let mut state = Self {
             graphics,
             scene_pipeline,
             ray_tracer,
@@ -758,6 +768,8 @@ impl AppState {
             editor: Editor::new(),
             mesh_sources,
             scene_path: scene_paths().into_iter().find(|p| p.exists()),
+            scene_name,
+            scene_textures,
             gpu_timer,
             profiler_visible: false,
             profiler_key_was_down: false,
@@ -823,7 +835,12 @@ impl AppState {
             should_exit: false,
             last_traced_position: Vec3::ZERO,
             last_trace_log: Instant::now(),
-        })
+        };
+        // Decode the scene's textures and build the GPU array. Done on the
+        // assembled state because it reports through the console and rewrites
+        // material components with resolved uv_scales.
+        state.apply_scene_textures();
+        Ok(state)
     }
 
     /// Handle a window resize. A minimized window reports 0x0, which must not
@@ -1622,6 +1639,83 @@ impl AppState {
         }
     }
 
+    /// Decode `scene_textures`, build the GPU texture array, and resolve each
+    /// material's `uv_scale` against its padded array layer.
+    ///
+    /// Called at startup and after every scene (re)load. A texture that fails
+    /// to decode becomes a loud 1x1 magenta placeholder rather than aborting
+    /// the scene: the scene is usable, the missing texture is unmissable, and
+    /// the error is in the log.
+    fn apply_scene_textures(&mut self) {
+        use crate::graphics::texture_array::{TextureArray, TextureData};
+
+        let mut datas: Vec<TextureData> = Vec::with_capacity(self.scene_textures.len());
+        for path in &self.scene_textures {
+            let candidates = [
+                std::path::PathBuf::from(path),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
+            ];
+            let decoded = candidates
+                .iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    crate::engine::core::EngineError::InvalidState(format!("{path}: not found"))
+                })
+                .and_then(crate::assets::png::load);
+            let data = match decoded {
+                Ok(image) => TextureData::new(image.width, image.height, image.pixels),
+                Err(e) => {
+                    eprintln!("texture: {path}: {e} (using magenta placeholder)");
+                    self.console
+                        .print_error(format!("[textures] {path}: {e}"));
+                    None
+                }
+            }
+            .unwrap_or_else(|| {
+                TextureData::new(1, 1, vec![255, 0, 255, 255]).expect("1x1 placeholder is valid")
+            });
+            datas.push(data);
+        }
+
+        match TextureArray::new(&self.graphics.device, &self.graphics.queue, &datas) {
+            Ok(array) => {
+                // Resolve every textured material's uv_scale against its layer.
+                // Written back into the components so the per-frame material
+                // registration (which reads components) uploads correct scales.
+                for entity in self.scene.all_entities().to_vec() {
+                    let Some(m) = self.scene.get_component::<MaterialComponent>(entity) else {
+                        continue;
+                    };
+                    if !m.has_texture() {
+                        continue;
+                    }
+                    if let Some(slot) = array.slot(m.texture_index as usize) {
+                        let mut updated = *m;
+                        updated.uv_scale = [slot.scale_u, slot.scale_v];
+                        self.scene.add_component(entity, updated);
+                    }
+                }
+                if !datas.is_empty() {
+                    let (w, h) = array.dimensions();
+                    eprintln!(
+                        "textures: {} layer(s) of {}x{}, {} KiB with mips",
+                        array.layer_count(),
+                        w,
+                        h,
+                        array.byte_size() / 1024
+                    );
+                }
+                self.scene_pipeline
+                    .set_texture_array(&self.graphics.device, array);
+            }
+            Err(e) => {
+                eprintln!("textures: failed to build the texture array: {e}");
+                self.console
+                    .print_error(format!("[textures] array build failed: {e}"));
+            }
+        }
+    }
+
     /// Write the scene back to the file it came from.
     fn save_scene(&mut self) {
         let Some(path) = self.scene_path.clone() else {
@@ -1630,12 +1724,13 @@ impl AppState {
             return;
         };
         let document = crate::scene::SceneDocument {
-            name: "material_spheres",
+            name: &self.scene_name,
             scene: &self.scene,
             camera: &self.camera,
             lights: &self.lights,
             hierarchy: &self.hierarchy,
             mesh_sources: &self.mesh_sources,
+            textures: &self.scene_textures,
         };
         match crate::scene::writer::save(&path, &document) {
             Ok(()) => {
@@ -1682,6 +1777,10 @@ impl AppState {
                         match crate::scene::load_scene_file(&path) {
                             Ok(loaded) => {
                                 self.replace_scene(loaded);
+                                // Saving must follow the file that is actually
+                                // loaded, or Ctrl-S would write this scene over
+                                // whatever file happened to be loaded first.
+                                self.scene_path = Some(path.clone());
                                 self.asset_reloads += 1;
                                 self.console.print(format!("[assets] reloaded {name}"));
                                 eprintln!("assets: reloaded scene {name}");
@@ -1712,6 +1811,21 @@ impl AppState {
                                     None => self.textures.push(texture),
                                 }
                                 self.asset_reloads += 1;
+                                // If the scene actually samples this file, rebuild
+                                // the texture array so the edit shows up. Matched
+                                // by file name, since scene paths are relative and
+                                // watcher paths may be absolute.
+                                let file = path.file_name().map(|n| n.to_string_lossy().to_string());
+                                let sampled = file.as_deref().is_some_and(|f| {
+                                    self.scene_textures
+                                        .iter()
+                                        .any(|t| std::path::Path::new(t).file_name()
+                                            .is_some_and(|n| n.to_string_lossy() == f))
+                                });
+                                if sampled {
+                                    self.apply_scene_textures();
+                                    self.console.print(format!("[assets] {name} re-applied to the scene"));
+                                }
                             }
                             Err(e) => self
                                 .console
@@ -1742,6 +1856,9 @@ impl AppState {
     /// longer exist and the tracer reflecting geometry that was deleted.
     fn replace_scene(&mut self, loaded: crate::scene::LoadedScene) {
         self.scene = loaded.scene;
+        self.scene_name = loaded.name;
+        self.scene_textures = loaded.textures;
+        self.apply_scene_textures();
         self.hierarchy = loaded.hierarchy;
         self.lights = loaded.lights;
         self.mesh_sources = loaded.mesh_sources;

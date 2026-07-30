@@ -32,14 +32,15 @@ pub const MAX_LIGHTS: usize = 8;
 /// Resolution of the (single, simplified) shadow map.
 const SHADOW_MAP_SIZE: u32 = 1024;
 
-/// Vertex attribute layout for `MeshVertex` (position, normal, color).
+/// Vertex attribute layout for `MeshVertex` (position, normal, color, uv).
 /// A `const` array gives it a `'static` lifetime so it can back more than
 /// one `wgpu::VertexBufferLayout` (opaque + transparent pipelines) without
 /// borrow-lifetime issues.
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] = [
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 4] = [
     pipeline::vertex_attr(0, wgpu::VertexFormat::Float32x3, 0),
     pipeline::vertex_attr(1, wgpu::VertexFormat::Float32x3, std::mem::size_of::<f32>() as u64 * 3),
     pipeline::vertex_attr(2, wgpu::VertexFormat::Float32x3, std::mem::size_of::<f32>() as u64 * 6),
+    pipeline::vertex_attr(3, wgpu::VertexFormat::Float32x2, std::mem::size_of::<f32>() as u64 * 9),
 ];
 
 /// A single light source: directional or point, selected by `position.w`
@@ -140,19 +141,33 @@ pub struct CameraUniform {
 
 unsafe impl crate::engine::core::Pod for CameraUniform {}
 
-/// Per-object (per mesh instance) GPU data: its model matrix plus which material
-/// it uses. Indexed in the shaders via `@builtin(instance_index)`.
+/// Per-object (per mesh instance) GPU data: its model matrix, the matching
+/// normal matrix, plus which material it uses. Indexed in the shaders via
+/// `@builtin(instance_index)`.
 ///
 /// Model matrix and material index live together — and are looked up by *object*
 /// index rather than material index — because materials are deduplicated
 /// (see `MaterialRegistry`): several objects legitimately share one material
 /// slot, so a material index can no longer identify an object.
 ///
-/// 16 floats + u32 + 3 u32 padding = 80 bytes (mat4x4 alignment is 16).
+/// The normal matrix is the inverse-transpose of the model's upper 3x3, stored
+/// as a full mat4x4 rather than a mat3x3: a WGSL mat3x3 is three vec4-padded
+/// columns (48 bytes) whose layout is easy to get subtly wrong against a Rust
+/// `[f32; 12]`, while a mat4x4 matches `[f32; 16]` exactly. Sixteen wasted
+/// bytes per object buy an unambiguous layout.
+///
+/// 32 floats + u32 + 3 u32 padding = 144 bytes (mat4x4 alignment is 16).
+/// This struct is read by BOTH `scene_vertex.wgsl` and `shadow_vertex.wgsl`;
+/// their `Object` structs must be kept identical or one of them walks the
+/// storage buffer at the wrong stride.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectUniform {
     pub model: [f32; 16],
+    /// Inverse-transpose of `model`'s upper 3x3, for transforming normals.
+    /// Equal to the rotation part when the scale is uniform; diverges exactly
+    /// when non-uniform scale would otherwise skew the normals.
+    pub normal: [f32; 16],
     pub material_index: u32,
     pub _padding: [u32; 3],
 }
@@ -161,9 +176,32 @@ unsafe impl crate::engine::core::Pod for ObjectUniform {}
 
 impl ObjectUniform {
     /// Build an object entry from a world matrix and a material slot.
+    ///
+    /// The normal matrix is computed here, once per object per frame, rather
+    /// than per vertex in the shader — WGSL has no matrix inverse, and even if
+    /// it did, inverting in the vertex stage would repeat the work thousands of
+    /// times. A singular model matrix (zero scale on some axis) has no inverse;
+    /// the model matrix itself is used then, which renders *something* (the old
+    /// behaviour) instead of NaN-ing every normal.
     pub fn new(model: Mat4, material_index: u32) -> Self {
+        let normal = model
+            .inverse_affine()
+            .map(|inv| inv.transpose())
+            .unwrap_or(model);
+        // Zero the translation row the transpose moved into the fourth column:
+        // normals are directions, and the shader multiplies with w = 0 anyway,
+        // but keeping the matrix clean makes it comparable in tests and dumps.
+        let mut normal_m = normal.m;
+        normal_m[3] = 0.0;
+        normal_m[7] = 0.0;
+        normal_m[11] = 0.0;
+        normal_m[12] = 0.0;
+        normal_m[13] = 0.0;
+        normal_m[14] = 0.0;
+        normal_m[15] = 1.0;
         Self {
             model: model.m,
+            normal: normal_m,
             material_index,
             _padding: [0, 0, 0],
         }
@@ -209,6 +247,12 @@ pub struct ScenePipeline {
     material_buffer: wgpu::Buffer,
     object_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Kept so the bind group can be rebuilt when the scene's texture set
+    /// changes (`set_texture_array`).
+    bind_group_layout: wgpu::BindGroupLayout,
+    /// The scene's texture array. Starts as a 1x1 white placeholder; owned
+    /// here because binding 8/9 reference its view and sampler.
+    texture_array: crate::graphics::texture_array::TextureArray,
     /// Offscreen render target texture (low-resolution).
     pub target_texture: Texture,
     pub target_view: TextureView,
@@ -239,6 +283,8 @@ pub struct ScenePipeline {
     #[allow(dead_code)]
     shadow_texture: Texture,
     shadow_view: TextureView,
+    /// Held so `set_texture_array` can rebuild the bind group that references it.
+    shadow_sampler: wgpu::Sampler,
     shadow_vp_buffer: wgpu::Buffer,
 }
 
@@ -251,6 +297,7 @@ impl ScenePipeline {
     /// ray queries is ever compiled on hardware that cannot run it.
     pub fn new(
         device: &Device,
+        queue: &Queue,
         width: u32,
         height: u32,
         format: TextureFormat,
@@ -324,7 +371,9 @@ impl ScenePipeline {
         });
 
         // Bind group layout: 0 = vp buffer, 1 = lights meta, 2 = lights storage,
-        // 3 = material storage, 4 = shadow map, 5 = shadow sampler, 6 = shadow view-proj.
+        // 3 = material storage, 4 = shadow map, 5 = shadow sampler, 6 = shadow view-proj,
+        // 7 = objects, 8 = texture array, 9 = texture sampler.
+        let texture_entries = crate::graphics::texture_array::TextureArray::layout_entries(8, 9);
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("scene_bind_group_layout"),
@@ -405,47 +454,29 @@ impl ScenePipeline {
                         },
                         count: None,
                     },
+                    texture_entries[0],
+                    texture_entries[1],
                 ],
             });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: vp_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: lights_meta_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: lights_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: material_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: shadow_vp_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: object_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        // The scene starts with an empty (1x1 white placeholder) texture array;
+        // `set_texture_array` swaps in the real one once the scene's textures
+        // are decoded, rebuilding the bind group.
+        let texture_array = crate::graphics::texture_array::TextureArray::new(device, queue, &[])?;
+
+        let bind_group = Self::create_scene_bind_group(
+            device,
+            &bind_group_layout,
+            &vp_buffer,
+            &lights_meta_buffer,
+            &lights_buffer,
+            &material_buffer,
+            &shadow_view,
+            &shadow_sampler,
+            &shadow_vp_buffer,
+            &object_buffer,
+            &texture_array,
+        );
 
         // Pipeline layout.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -687,6 +718,8 @@ impl ScenePipeline {
             material_buffer,
             object_buffer,
             bind_group,
+            bind_group_layout,
+            texture_array,
             target_texture,
             target_view,
             depth_texture,
@@ -701,8 +734,105 @@ impl ScenePipeline {
             shadow_bind_group,
             shadow_texture,
             shadow_view,
+            shadow_sampler,
             shadow_vp_buffer,
         })
+    }
+
+    /// Build the group-0 bind group. Split out of `new` because the texture
+    /// array can be replaced at runtime (scene reload), which requires
+    /// rebuilding the whole group — bind groups are immutable.
+    #[allow(clippy::too_many_arguments)]
+    fn create_scene_bind_group(
+        device: &Device,
+        layout: &wgpu::BindGroupLayout,
+        vp_buffer: &wgpu::Buffer,
+        lights_meta_buffer: &wgpu::Buffer,
+        lights_buffer: &wgpu::Buffer,
+        material_buffer: &wgpu::Buffer,
+        shadow_view: &TextureView,
+        shadow_sampler: &wgpu::Sampler,
+        shadow_vp_buffer: &wgpu::Buffer,
+        object_buffer: &wgpu::Buffer,
+        texture_array: &crate::graphics::texture_array::TextureArray,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_bind_group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lights_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: material_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: shadow_vp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: object_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(texture_array.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(texture_array.sampler()),
+                },
+            ],
+        })
+    }
+
+    /// Replace the scene's texture array (scene load/reload) and rebuild the
+    /// bind group that references it.
+    pub fn set_texture_array(
+        &mut self,
+        device: &Device,
+        texture_array: crate::graphics::texture_array::TextureArray,
+    ) {
+        self.texture_array = texture_array;
+        self.bind_group = Self::create_scene_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.vp_buffer,
+            &self.lights_meta_buffer,
+            &self.lights_buffer,
+            &self.material_buffer,
+            &self.shadow_view,
+            // The shadow sampler lives only inside the bind group today; keep a
+            // handle so the rebuild can reference it.
+            &self.shadow_sampler,
+            &self.shadow_vp_buffer,
+            &self.object_buffer,
+            &self.texture_array,
+        );
+    }
+
+    /// The current texture array (for the profiler and for resolving
+    /// per-material UV scales).
+    pub fn texture_array(&self) -> &crate::graphics::texture_array::TextureArray {
+        &self.texture_array
     }
 
     /// Upload the shadow-casting light's view-projection matrix (see
@@ -1123,9 +1253,9 @@ mod tests {
 
     #[test]
     fn object_uniform_layout_matches_wgsl_expectations() {
-        // mat4x4<f32> (64) + u32 (4) + 3 * u32 padding (12) = 80, a multiple of
-        // the 16-byte alignment a mat4x4 member forces on the struct.
-        assert_eq!(std::mem::size_of::<ObjectUniform>(), 80);
+        // 2 * mat4x4<f32> (128) + u32 (4) + 3 * u32 padding (12) = 144, a
+        // multiple of the 16-byte alignment a mat4x4 member forces on the struct.
+        assert_eq!(std::mem::size_of::<ObjectUniform>(), 144);
         assert_eq!(std::mem::size_of::<ObjectUniform>() % 16, 0);
     }
 
@@ -1139,5 +1269,59 @@ mod tests {
         let restored = Mat4::from_cols_array(obj.model);
         assert_eq!(restored, model);
         assert_eq!(restored.transform_point(Vec3::ZERO), Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn normal_matrix_equals_rotation_for_rigid_transforms() {
+        // For rotation + translation (no scale) the inverse-transpose IS the
+        // rotation, so the normal matrix must match the model's upper 3x3.
+        let model = Mat4::translation(5.0, -2.0, 1.0).mul(Mat4::rotation_y(0.9));
+        let obj = ObjectUniform::new(model, 0);
+        let n = Mat4::from_cols_array(obj.normal);
+        let dir = Vec3::new(0.3, 0.8, -0.5).normalize();
+        let want = model.transform_dir(dir);
+        let got = n.transform_dir(dir);
+        assert!((want - got).length() < 1e-5, "want {want}, got {got}");
+        // And translation must not leak into it.
+        assert_eq!(n.transform_dir(Vec3::ZERO), Vec3::ZERO);
+    }
+
+    /// The plan's own acceptance test for 0.1: an ellipsoid from scale (2,1,1)
+    /// must keep the normal at its "north pole" pointing straight up, and a
+    /// side normal must be *corrected*, not just scaled. Using the model matrix
+    /// (the old behaviour) fails the side-normal check.
+    #[test]
+    fn normal_matrix_corrects_normals_under_non_uniform_scale() {
+        let model = Mat4::scaling(2.0, 1.0, 1.0);
+        let obj = ObjectUniform::new(model, 0);
+        let n = Mat4::from_cols_array(obj.normal);
+
+        // Top of the sphere: normal (0,1,0) must stay (0,1,0).
+        let top = n.transform_dir(Vec3::UNIT_Y).normalize();
+        assert!((top - Vec3::UNIT_Y).length() < 1e-6, "top normal became {top}");
+
+        // A 45-degree normal on the unit sphere. On the ellipsoid the surface
+        // flattens along x, so the true normal leans *away* from x — the
+        // inverse-transpose divides the x component by the scale.
+        let slanted = Vec3::new(1.0, 1.0, 0.0).normalize();
+        let corrected = n.transform_dir(slanted).normalize();
+        let expected = Vec3::new(0.5, 1.0, 0.0).normalize();
+        assert!(
+            (corrected - expected).length() < 1e-5,
+            "expected {expected}, got {corrected}"
+        );
+        // The model matrix would have produced the opposite lean — assert the
+        // difference so this test cannot silently pass with the old code.
+        let wrong = model.transform_dir(slanted).normalize();
+        assert!((corrected - wrong).length() > 0.1, "normal matrix must differ from model matrix here");
+    }
+
+    #[test]
+    fn normal_matrix_survives_a_singular_model_matrix() {
+        // Zero scale has no inverse; the fallback keeps rendering (with the old
+        // incorrect-under-scale normals) rather than poisoning the frame with NaN.
+        let model = Mat4::scaling(1.0, 0.0, 1.0);
+        let obj = ObjectUniform::new(model, 0);
+        assert!(obj.normal.iter().all(|v| v.is_finite()));
     }
 }

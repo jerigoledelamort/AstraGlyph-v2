@@ -30,8 +30,8 @@ struct TracedInstance {
 @group(1) @binding(1) var<storage, read> traced_instances: array<TracedInstance>;
 
 // The geometry heap. Typed as a flat float array rather than an array of vertex
-// structs because a WGSL struct of three vec3<f32> is padded to 48 bytes, which
-// would disagree with the 36-byte stride the acceleration-structure builder
+// structs because a WGSL struct of vec3s is padded to 16-byte columns, which
+// would disagree with the 44-byte stride the acceleration-structure builder
 // reads from the very same memory.
 @group(1) @binding(2) var<storage, read> heap_vertices: array<f32>;
 @group(1) @binding(3) var<storage, read> heap_indices: array<u32>;
@@ -55,8 +55,12 @@ const FLAG_REFLECTIONS: u32 = 2u;
 const FLAG_REFRACTION: u32 = 4u;
 const FLAG_AO: u32 = 8u;
 
-/// Floats per heap vertex: position(3) + normal(3) + colour(3).
-const HEAP_STRIDE: u32 = 9u;
+/// Floats per heap vertex: position(3) + normal(3) + colour(3) + uv(2).
+/// Mirrors `renderer::raytrace::HEAP_FLOATS_PER_VERTEX` — change together.
+const HEAP_STRIDE: u32 = 11u;
+/// f32 offsets of the fields inside one heap vertex.
+const HEAP_NORMAL_OFFSET: u32 = 3u;
+const HEAP_UV_OFFSET: u32 = 9u;
 
 /// How far a secondary ray starts from the surface it left.
 ///
@@ -162,10 +166,15 @@ struct TracedHit {
     normal: vec3<f32>,
     material_index: u32,
     distance: f32,
+    uv: vec2<f32>,
 };
 
 fn heap_vec3(base: u32) -> vec3<f32> {
     return vec3<f32>(heap_vertices[base], heap_vertices[base + 1u], heap_vertices[base + 2u]);
+}
+
+fn heap_vec2(base: u32) -> vec2<f32> {
+    return vec2<f32>(heap_vertices[base], heap_vertices[base + 1u]);
 }
 
 /// Closest hit along a ray, with the surface normal interpolated from the
@@ -176,13 +185,55 @@ fn heap_vec3(base: u32) -> vec3<f32> {
 /// below the `kind` check is the cost of that: look up the instance record, walk
 /// the index heap to the primitive, read three vertex normals, and blend them by
 /// the reported barycentrics.
+/// How many alpha-tested surfaces a single ray may pass through before the
+/// next one is treated as opaque. Two layers of fence read correctly; a stack
+/// of ten is spending rays on something the glyph grid cannot resolve anyway.
+const MAX_ALPHA_SKIPS: u32 = 4u;
+
 fn trace_closest(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> TracedHit {
+    // Alpha-tested geometry is still OPAQUE to the ray query (naga has no
+    // candidate-intersection support to do this in-traversal), so a cutout is
+    // handled by *re-casting*: hit an alpha-test surface, sample its texture,
+    // and if the texel is transparent, start a new ray just past the hit.
+    var start = origin;
+    var range = tmax;
+    for (var skip = 0u; skip <= MAX_ALPHA_SKIPS; skip = skip + 1u) {
+        let h = trace_closest_raw(start, dir, tmin, range);
+        if (!h.hit) {
+            return h;
+        }
+        let mat = materials[h.material_index];
+        if ((mat.flags & MATERIAL_FLAG_ALPHA_TEST) != 0u) {
+            let texel = surface_color_level(mat, h.uv, ray_mip_level(h.distance));
+            if (texel.a < 0.5) {
+                // Continue from just past the hole. tmin stays as given; the
+                // remaining range shrinks by the distance already travelled.
+                let step = h.distance + SURFACE_EPSILON * (1.0 + h.distance);
+                start = start + normalize(dir) * step;
+                range = range - step;
+                if (range <= tmin) {
+                    var miss: TracedHit;
+                    miss.hit = false;
+                    return miss;
+                }
+                continue;
+            }
+        }
+        return h;
+    }
+    // Skip budget exhausted: return the last surface as-is (opaque). Wrong
+    // only for >4 stacked cutouts, and bounded.
+    return trace_closest_raw(start, dir, tmin, range);
+}
+
+fn trace_closest_raw(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> TracedHit {
     var out: TracedHit;
     out.hit = false;
     out.position = origin;
     out.normal = vec3<f32>(0.0, 1.0, 0.0);
     out.material_index = 0u;
     out.distance = tmax;
+    out.uv = vec2<f32>(0.0, 0.0);
 
     var rq: ray_query;
     rayQueryInitialize(
@@ -205,17 +256,29 @@ fn trace_closest(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> Tra
     let i1 = inst.vertex_offset + heap_indices[base + 1u];
     let i2 = inst.vertex_offset + heap_indices[base + 2u];
 
-    let n0 = heap_vec3(i0 * HEAP_STRIDE + 3u);
-    let n1 = heap_vec3(i1 * HEAP_STRIDE + 3u);
-    let n2 = heap_vec3(i2 * HEAP_STRIDE + 3u);
+    let n0 = heap_vec3(i0 * HEAP_STRIDE + HEAP_NORMAL_OFFSET);
+    let n1 = heap_vec3(i1 * HEAP_STRIDE + HEAP_NORMAL_OFFSET);
+    let n2 = heap_vec3(i2 * HEAP_STRIDE + HEAP_NORMAL_OFFSET);
 
     // Barycentrics report the second and third weights; the first is implied.
     let b = isect.barycentrics;
-    let local_normal = n0 * (1.0 - b.x - b.y) + n1 * b.x + n2 * b.y;
+    let w0 = 1.0 - b.x - b.y;
+    let local_normal = n0 * w0 + n1 * b.x + n2 * b.y;
+
+    // UV interpolates by exactly the same weights as the normal.
+    let uv0 = heap_vec2(i0 * HEAP_STRIDE + HEAP_UV_OFFSET);
+    let uv1 = heap_vec2(i1 * HEAP_STRIDE + HEAP_UV_OFFSET);
+    let uv2 = heap_vec2(i2 * HEAP_STRIDE + HEAP_UV_OFFSET);
+    out.uv = uv0 * w0 + uv1 * b.x + uv2 * b.y;
 
     // object_to_world is a mat4x3: three basis columns then a translation.
     // Rotating the normal by the basis is correct for rotation and uniform
-    // scale, matching the rasterised path's documented limitation.
+    // scale only. The rasterised path (and the primary hit of the traced one,
+    // which shades the rasterised fragment) uses a per-object inverse-transpose
+    // and gets non-uniform scale right; here that would mean carrying a normal
+    // matrix in every TracedInstance. Until an instance record grows one, a
+    // non-uniformly scaled mesh seen in a reflection or through glass keeps
+    // slightly skewed normals — said plainly rather than hidden.
     let o2w = isect.object_to_world;
     let basis = mat3x3<f32>(o2w[0], o2w[1], o2w[2]);
 
@@ -232,6 +295,10 @@ fn trace_closest(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> Tra
 /// Uses TERMINATE_ON_FIRST_HIT: a shadow ray does not care which surface blocks
 /// it, only that one does, and letting the traversal stop early is most of the
 /// reason shadow rays are affordable at all.
+///
+/// Alpha-tested surfaces cast *opaque* shadows here: honouring the cutout
+/// would forfeit TERMINATE_ON_FIRST_HIT and re-cast per hole per sample per
+/// light. A documented first-iteration limitation — a fence shadows as a wall.
 fn trace_occluded(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> bool {
     if (tmax <= tmin) {
         return false;
@@ -321,8 +388,13 @@ fn traced_ao(pos: vec3<f32>, normal: vec3<f32>, seed: ptr<function, u32>) -> f32
 /// This is where the traced path earns its name. The rasterised version can only
 /// shadow light[0], because there is only one shadow map; here the cost of one
 /// more shadowed light is one more ray.
+// `albedo` is passed in rather than read from the material because it may be
+// texture-modulated, and the sampling strategy differs by caller: the primary
+// hit has screen derivatives (textureSample), a ray hit does not
+// (textureSampleLevel with a distance-based level).
 fn traced_direct(
     mat: Material,
+    albedo: vec3<f32>,
     pos: vec3<f32>,
     normal: vec3<f32>,
     view_dir: vec3<f32>,
@@ -352,7 +424,17 @@ fn traced_direct(
         occlusion = traced_ao(pos, normal, seed);
     }
 
-    return mat.albedo.rgb * (ambient_sum * occlusion + lit);
+    return albedo * (ambient_sum * occlusion + lit);
+}
+
+/// Mip level for a ray-hit sample: no screen derivatives exist along a ray, so
+/// approximate from the hit distance. The constant is tuned for the subpixel
+/// target — at 240x136 a surface a few units away is already minified several
+/// levels. The output is quantized to glyphs, so a coarse heuristic suffices;
+/// what matters is *not* sampling mip 0 at distance, which aliases into noise
+/// the ASCII stage amplifies.
+fn ray_mip_level(distance: f32) -> f32 {
+    return max(0.0, log2(max(distance, 1.0)));
 }
 
 /// Follow a secondary ray through up to `max_depth` bounces and return the
@@ -399,13 +481,16 @@ fn trace_path(start_origin: vec3<f32>, start_dir: vec3<f32>, seed_in: u32) -> ve
         // points once float spacing at that magnitude exceeds it.
         let eps = SURFACE_EPSILON * (1.0 + h.distance);
 
-        let direct = traced_direct(mat, h.position, normal, view_dir, &seed);
+        // Texture-modulated albedo at the hit point. No screen derivatives on
+        // a ray, so the mip comes from the hit distance.
+        let hit_albedo = surface_color_level(mat, h.uv, ray_mip_level(h.distance)).rgb;
+        let direct = traced_direct(mat, hit_albedo, h.position, normal, view_dir, &seed);
         let fres = fresnel_weight(normal, view_dir);
 
         if (mat.material_type == MATERIAL_MIRROR && reflections_on) {
             let k = clamp(mat.reflectivity + (1.0 - mat.reflectivity) * fres, 0.0, 1.0);
             accum = accum + throughput * direct * (1.0 - k);
-            throughput = throughput * k * mat.albedo.rgb;
+            throughput = throughput * k * hit_albedo;
             origin = h.position + normal * eps;
             dir = reflect(dir, normal);
         } else if (mat.material_type == MATERIAL_GLASS && refraction_on) {
@@ -428,7 +513,7 @@ fn trace_path(start_origin: vec3<f32>, start_dir: vec3<f32>, seed_in: u32) -> ve
             }
             // Coloured glass filters what passes through it.
             throughput = throughput
-                * mix(vec3<f32>(1.0, 1.0, 1.0), mat.albedo.rgb, mat.transparency)
+                * mix(vec3<f32>(1.0, 1.0, 1.0), hit_albedo, mat.transparency)
                 * mat.transparency;
         } else {
             // Matte, or a bouncing material with its bounce disabled: the path
@@ -459,6 +544,14 @@ fn trace_path(start_origin: vec3<f32>, start_dir: vec3<f32>, seed_in: u32) -> ve
 fn main(input: VertexOutput) -> @location(0) vec4<f32> {
     let world_pos = input.world_pos;
     let mat = materials[input.material_index];
+
+    // Primary hit is rasterised, so it has real derivatives: textureSample.
+    // Must run before the discard below (uniform control flow).
+    let surface = surface_color(mat, input.uv);
+    if ((mat.flags & MATERIAL_FLAG_ALPHA_TEST) != 0u && surface.a < 0.5) {
+        discard;
+    }
+
     let view_dir = normalize(camera.camera_pos - world_pos);
 
     var normal = normalize(input.world_normal);
@@ -468,16 +561,17 @@ fn main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     var seed = pixel_seed(input.clip_pos.xy);
 
-    var color = traced_direct(mat, world_pos, normal, view_dir, &seed);
+    var color = traced_direct(mat, surface.rgb, world_pos, normal, view_dir, &seed);
     let fres = fresnel_weight(normal, view_dir);
     let reflections_on = (trace.flags & FLAG_REFLECTIONS) != 0u;
     let refraction_on = (trace.flags & FLAG_REFRACTION) != 0u;
 
     if (mat.material_type == MATERIAL_MIRROR && reflections_on) {
         let refl = reflect(-view_dir, normal);
-        // Metal tints its reflection with its own albedo, same as the raster path.
+        // Metal tints its reflection with its own (texture-modulated) albedo,
+        // same as the raster path.
         let reflected = trace_path(world_pos + normal * SURFACE_EPSILON, refl, seed)
-            * mat.albedo.rgb;
+            * surface.rgb;
         let k = clamp(mat.reflectivity + (1.0 - mat.reflectivity) * fres, 0.0, 1.0);
         color = mix(color, reflected, k);
     } else if (mat.material_type == MATERIAL_GLASS && refraction_on) {
@@ -501,7 +595,7 @@ fn main(input: VertexOutput) -> @location(0) vec4<f32> {
         );
 
         color = color * (1.0 - mat.transparency)
-            + through * mix(vec3<f32>(1.0, 1.0, 1.0), mat.albedo.rgb, mat.transparency)
+            + through * mix(vec3<f32>(1.0, 1.0, 1.0), surface.rgb, mat.transparency)
                 * mat.transparency
             + sheen * fres;
     }

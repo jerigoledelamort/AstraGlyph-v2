@@ -25,14 +25,19 @@ use crate::engine::math::Mat4;
 use crate::scene::component::MeshComponent;
 use wgpu::{Device, Queue};
 
-/// Floats per vertex in the geometry heap: position(3) + normal(3) + color(3).
+/// Floats per vertex in the geometry heap:
+/// position(3) + normal(3) + color(3) + uv(2).
 ///
 /// The heap is typed `array<f32>` in WGSL rather than `array<Vertex>` on
-/// purpose: a WGSL struct of three `vec3<f32>` is padded to 48 bytes under
-/// std430 alignment rules, which would silently disagree with the 36-byte
+/// purpose: a WGSL struct of vec3s is padded to 16-byte columns under std430
+/// alignment rules, which would silently disagree with the 44-byte
 /// `MeshVertex` the acceleration-structure builder reads from the same memory.
 /// A flat float array has no alignment opinion, so both readers agree.
-pub const HEAP_FLOATS_PER_VERTEX: usize = 9;
+///
+/// Mirrored in WGSL as `HEAP_STRIDE` in `scene_traced_fragment.wgsl` — the two
+/// must change together, and `heap_stride_matches_the_mesh_vertex_layout`
+/// below pins this side to the actual struct size.
+pub const HEAP_FLOATS_PER_VERTEX: usize = 11;
 
 /// Byte stride of one heap vertex, as the BLAS builder sees it.
 pub const HEAP_VERTEX_STRIDE: u64 = (HEAP_FLOATS_PER_VERTEX * 4) as u64;
@@ -482,6 +487,8 @@ impl RayTracer {
                 v.color.x,
                 v.color.y,
                 v.color.z,
+                v.uv.x,
+                v.uv.y,
             ]);
         }
         // Indices are stored mesh-relative. The BLAS builder is told where the

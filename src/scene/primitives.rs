@@ -2,7 +2,7 @@
 // All generators produce MeshComponent with computed normals and vertex colors.
 
 use crate::engine::geometry::Shape;
-use crate::engine::math::Vec3;
+use crate::engine::math::{Vec2, Vec3};
 use crate::scene::{MeshComponent, MeshVertex};
 
 /// Standard constant for PI.
@@ -73,10 +73,21 @@ pub fn sphere(
                 center.z + radius * nz,
             );
 
+            // Equirectangular unwrap: u sweeps longitude, v latitude. The seam
+            // duplicate at lon == lon_segments gets u = 1.0 rather than wrapping
+            // back to 0.0 — the whole reason the seam vertex is duplicated is so
+            // interpolation runs 0.96 -> 1.0 there instead of 0.96 -> 0.0, which
+            // would smear the entire texture backwards across one quad.
+            let uv = Vec2::new(
+                lon as f32 / lon_segments as f32,
+                lat as f32 / lat_segments as f32,
+            );
+
             vertices.push(MeshVertex {
                 position,
                 normal: Vec3::new(nx, ny, nz),
                 color,
+                uv,
             });
         }
     }
@@ -111,11 +122,20 @@ pub fn plane(center: Vec3, size: f32, color: Vec3) -> MeshComponent {
     let y = center.y;
     let z = center.z;
 
+    // Planar unwrap with tiling: one UV unit per two world units, so a texture
+    // repeats rather than being stretched across the whole plane. A 50-unit
+    // ground at one repeat total would smear any texture into unreadable blur —
+    // and with a `Repeat` sampler, UVs past 1.0 are exactly how tiling works.
+    let tile = |world: f32| world / 2.0;
     let vertices = vec![
-        MeshVertex { position: Vec3::new(x - size, y, z - size), normal: Vec3::UNIT_Y, color },
-        MeshVertex { position: Vec3::new(x + size, y, z - size), normal: Vec3::UNIT_Y, color },
-        MeshVertex { position: Vec3::new(x + size, y, z + size), normal: Vec3::UNIT_Y, color },
-        MeshVertex { position: Vec3::new(x - size, y, z + size), normal: Vec3::UNIT_Y, color },
+        MeshVertex { position: Vec3::new(x - size, y, z - size), normal: Vec3::UNIT_Y, color,
+                     uv: Vec2::new(tile(-size), tile(-size)) },
+        MeshVertex { position: Vec3::new(x + size, y, z - size), normal: Vec3::UNIT_Y, color,
+                     uv: Vec2::new(tile(size), tile(-size)) },
+        MeshVertex { position: Vec3::new(x + size, y, z + size), normal: Vec3::UNIT_Y, color,
+                     uv: Vec2::new(tile(size), tile(size)) },
+        MeshVertex { position: Vec3::new(x - size, y, z + size), normal: Vec3::UNIT_Y, color,
+                     uv: Vec2::new(tile(-size), tile(size)) },
     ];
 
     // Winding matters: the pipeline culls back faces with `front_face: Ccw`, so
@@ -124,6 +144,80 @@ pub fn plane(center: Vec3, size: f32, color: Vec3) -> MeshComponent {
     // The naive 0,1,2 / 0,2,3 order produces a DOWNWARD geometric normal, which
     // made the ground plane invisible from any camera above it.
     let indices = vec![0, 2, 1, 0, 3, 2];
+
+    MeshComponent::new(vertices, indices)
+}
+
+/// Generate a box mesh centred at the origin with half-extents `half`.
+/// Placement belongs to the entity's transform.
+///
+/// 24 vertices (four per face, so each face keeps its flat normal) with a
+/// per-face UV unwrap, oriented so v grows downward in texture space when the
+/// face is viewed from outside. Per-face rather than a cross layout because a
+/// repeating material (crate, brick) is what a box in a game actually wears;
+/// a cross unwrap only pays off for hand-painted textures, which need an
+/// artist's unwrap anyway.
+///
+/// UV density matches `plane`: one texture repeat per two world units, so the
+/// same material tiles at the same scale on a floor and on a crate standing on
+/// it. A face of a unit-half-extent box (2x2 units) gets exactly one repeat;
+/// larger boxes tile via the Repeat sampler.
+pub fn box_mesh(half: Vec3, color: Vec3) -> MeshComponent {
+    let (hx, hy, hz) = (half.x, half.y, half.z);
+    let p = Vec3::new;
+
+    // Corner positions per face, wound CCW seen from outside (matching the
+    // face normal), with UVs walking (0,v) -> (u,v) -> (u,0) -> (0,0) so the
+    // texture is upright from outside; (u, v) are the face's world dimensions
+    // over the 2-units-per-tile density.
+    struct Face {
+        corners: [Vec3; 4],
+        normal: Vec3,
+        /// Face size in world units along its UV axes.
+        size: (f32, f32),
+    }
+    let faces = [
+        // Front (z = -hz, normal -Z): seen from -Z, +X is to the *left*.
+        Face { corners: [p(hx, -hy, -hz), p(-hx, -hy, -hz), p(-hx, hy, -hz), p(hx, hy, -hz)],
+               normal: p(0.0, 0.0, -1.0), size: (2.0 * hx, 2.0 * hy) },
+        // Back (z = +hz, normal +Z).
+        Face { corners: [p(-hx, -hy, hz), p(hx, -hy, hz), p(hx, hy, hz), p(-hx, hy, hz)],
+               normal: p(0.0, 0.0, 1.0), size: (2.0 * hx, 2.0 * hy) },
+        // Left (x = -hx, normal -X).
+        Face { corners: [p(-hx, -hy, -hz), p(-hx, -hy, hz), p(-hx, hy, hz), p(-hx, hy, -hz)],
+               normal: p(-1.0, 0.0, 0.0), size: (2.0 * hz, 2.0 * hy) },
+        // Right (x = +hx, normal +X).
+        Face { corners: [p(hx, -hy, hz), p(hx, -hy, -hz), p(hx, hy, -hz), p(hx, hy, hz)],
+               normal: p(1.0, 0.0, 0.0), size: (2.0 * hz, 2.0 * hy) },
+        // Bottom (y = -hy, normal -Y).
+        Face { corners: [p(-hx, -hy, -hz), p(hx, -hy, -hz), p(hx, -hy, hz), p(-hx, -hy, hz)],
+               normal: p(0.0, -1.0, 0.0), size: (2.0 * hx, 2.0 * hz) },
+        // Top (y = +hy, normal +Y).
+        Face { corners: [p(-hx, hy, hz), p(hx, hy, hz), p(hx, hy, -hz), p(-hx, hy, -hz)],
+               normal: p(0.0, 1.0, 0.0), size: (2.0 * hx, 2.0 * hz) },
+    ];
+
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    for face in &faces {
+        let (u_max, v_max) = (face.size.0 / 2.0, face.size.1 / 2.0);
+        let face_uvs = [
+            Vec2::new(0.0, v_max),
+            Vec2::new(u_max, v_max),
+            Vec2::new(u_max, 0.0),
+            Vec2::new(0.0, 0.0),
+        ];
+        let base = vertices.len() as u32;
+        for (corner, uv) in face.corners.iter().zip(face_uvs.iter()) {
+            vertices.push(MeshVertex {
+                position: *corner,
+                normal: face.normal,
+                color,
+                uv: *uv,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
 
     MeshComponent::new(vertices, indices)
 }
@@ -187,6 +281,69 @@ mod tests {
     }
 
     #[test]
+    fn sphere_uv_is_an_equirectangular_unwrap() {
+        let m = sphere(Vec3::ZERO, 1.0, Vec3::ONE, 8, 12);
+        // Poles: v = 0 at the top ring, v = 1 at the bottom.
+        assert_eq!(m.vertices.first().unwrap().uv.y, 0.0);
+        assert_eq!(m.vertices.last().unwrap().uv.y, 1.0);
+        // The seam duplicate must carry u = 1.0, not wrap back to 0.0 —
+        // otherwise the last quad of every ring interpolates u from ~0.9 down
+        // to 0 and smears the whole texture backwards across it.
+        let stride = 12 + 1;
+        for ring in 0..=8u32 {
+            let first = m.vertices[(ring * stride) as usize].uv;
+            let seam = m.vertices[(ring * stride + 12) as usize].uv;
+            assert_eq!(first.x, 0.0);
+            assert_eq!(seam.x, 1.0, "seam vertex must close the unwrap");
+        }
+        // All UVs in range.
+        for v in &m.vertices {
+            assert!((0.0..=1.0).contains(&v.uv.x) && (0.0..=1.0).contains(&v.uv.y));
+        }
+    }
+
+    #[test]
+    fn plane_uv_tiles_with_world_size() {
+        // Half-extent 4 => 8 world units => 4 UV repeats at 2 units per tile.
+        let m = plane(Vec3::ZERO, 4.0, Vec3::ONE);
+        let us: Vec<f32> = m.vertices.iter().map(|v| v.uv.x).collect();
+        let span = us.iter().fold(f32::MIN, |a, &b| a.max(b))
+            - us.iter().fold(f32::MAX, |a, &b| a.min(b));
+        assert!((span - 4.0).abs() < 1e-5, "expected 4 repeats, got {span}");
+        // The centre offset must not shift the tiling density.
+        let m2 = plane(Vec3::new(100.0, 0.0, -3.0), 4.0, Vec3::ONE);
+        let us2: Vec<f32> = m2.vertices.iter().map(|v| v.uv.x).collect();
+        let span2 = us2.iter().fold(f32::MIN, |a, &b| a.max(b))
+            - us2.iter().fold(f32::MAX, |a, &b| a.min(b));
+        assert!((span2 - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn box_mesh_has_a_full_per_face_unwrap() {
+        let m = box_mesh(Vec3::new(1.0, 1.0, 1.0), Vec3::ONE);
+        assert_eq!(m.vertices.len(), 24);
+        assert_eq!(m.indices.len(), 36);
+        // Every face must span the full 0..1 square.
+        for face in m.vertices.chunks(4) {
+            let mut us: Vec<f32> = face.iter().map(|v| v.uv.x).collect();
+            let mut vs: Vec<f32> = face.iter().map(|v| v.uv.y).collect();
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            vs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!((us[0], us[3]), (0.0, 1.0), "face does not span u");
+            assert_eq!((vs[0], vs[3]), (0.0, 1.0), "face does not span v");
+        }
+        // Each face's four corners are coplanar with its normal.
+        for face in m.vertices.chunks(4) {
+            let n = face[0].normal;
+            let d = face[0].position.dot(n);
+            for v in face {
+                assert_eq!(v.normal, n);
+                assert!((v.position.dot(n) - d).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
     fn plane_vertex_and_index_count() {
         let m = plane(Vec3::ZERO, 10.0, Vec3::ONE);
         assert_eq!(m.vertices.len(), 4);
@@ -213,6 +370,7 @@ mod tests {
             plane(Vec3::new(1.0, -2.0, 3.0), 4.0, Vec3::ONE),
             sphere(Vec3::ZERO, 1.0, Vec3::ONE, 6, 8),
             sphere(Vec3::new(2.0, 0.0, -1.0), 2.5, Vec3::ONE, 4, 5),
+            box_mesh(Vec3::new(1.0, 2.0, 0.5), Vec3::ONE),
         ] {
             assert_eq!(mesh.indices.len() % 3, 0, "indices must form whole triangles");
             for tri in mesh.indices.chunks(3) {

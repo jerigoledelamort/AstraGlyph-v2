@@ -22,6 +22,13 @@
 // The shading model is a hand port of `scene_shading.wgsl`. That duplication is
 // unavoidable across two languages, and it is pinned by tests that check the
 // ported functions against the values the WGSL is specified to produce.
+//
+// Textures are NOT sampled here. Analytic shapes carry no UVs (a sphere's
+// equation has no seam), so a textured material falls back to its albedo
+// colour — the same thing the GPU paths show for a material whose texture
+// failed to load. Said plainly: the CPU fallback renders textured scenes in
+// flat colour. Wiring a procedural unwrap per shape is possible but only
+// worth it if the fallback gains a real audience.
 
 use crate::engine::geometry::{ray, Ray, RayHit, WorldShape};
 use crate::engine::math::Vec3;

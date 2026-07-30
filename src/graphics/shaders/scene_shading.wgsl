@@ -32,6 +32,7 @@ struct LightsMeta {
 @group(0) @binding(1) var<uniform> lights_meta: LightsMeta;
 @group(0) @binding(2) var<storage, read> lights: array<Light>;
 
+// Mirrors `scene::component::MaterialUniform` field for field (64 bytes).
 struct Material {
     albedo: vec4<f32>,
     material_type: u32,
@@ -42,9 +43,67 @@ struct Material {
     ior: f32,
     reflectivity: f32,
     transparency: f32,
+    texture_index: u32,
+    flags: u32,
+    uv_scale: vec2<f32>,
 };
 
 @group(0) @binding(3) var<storage, read> materials: array<Material>;
+
+// Every texture the scene samples, as layers of one array (see
+// `graphics::texture_array` for why an array and not an atlas or bindings).
+@group(0) @binding(8) var scene_textures: texture_2d_array<f32>;
+@group(0) @binding(9) var scene_texture_sampler: sampler;
+
+/// Mirrors `scene::component::NO_TEXTURE` / `texture_array::NO_TEXTURE`.
+const NO_TEXTURE: u32 = 0xFFFFFFFFu;
+/// Mirrors `scene::component::material_flags::ALPHA_TEST`.
+const MATERIAL_FLAG_ALPHA_TEST: u32 = 1u;
+
+/// Map a mesh UV into a padded array layer: tile first (fract), then squeeze
+/// into the fraction of the layer the real texels cover. The order matters —
+/// scaling before wrapping would tile across the padding.
+fn layer_uv(mat: Material, uv: vec2<f32>) -> vec2<f32> {
+    return fract(uv) * mat.uv_scale;
+}
+
+/// Surface colour+alpha of a material at `uv`, for the rasterised path:
+/// albedo times the sampled texel, or the albedo alone when untextured.
+/// `textureSample` needs uniform control flow for its implicit derivatives,
+/// so the sample is unconditional and the untextured case selects afterwards.
+fn surface_color(mat: Material, uv: vec2<f32>) -> vec4<f32> {
+    // Layer 0 for the untextured case: the sample result is discarded below,
+    // but the *index* must stay in bounds rather than relying on robustness
+    // clamping to make an out-of-range layer harmless.
+    let layer = select(i32(mat.texture_index), 0, mat.texture_index == NO_TEXTURE);
+    let texel = textureSample(
+        scene_textures,
+        scene_texture_sampler,
+        layer_uv(mat, uv),
+        layer,
+    );
+    if (mat.texture_index == NO_TEXTURE) {
+        return vec4<f32>(mat.albedo.rgb, 1.0);
+    }
+    return vec4<f32>(mat.albedo.rgb * texel.rgb, texel.a);
+}
+
+/// Same, for contexts with no screen-space derivatives (ray hits): the mip
+/// level is chosen by the caller. Free of uniformity requirements, so the
+/// untextured branch can skip the sample entirely.
+fn surface_color_level(mat: Material, uv: vec2<f32>, level: f32) -> vec4<f32> {
+    if (mat.texture_index == NO_TEXTURE) {
+        return vec4<f32>(mat.albedo.rgb, 1.0);
+    }
+    let texel = textureSampleLevel(
+        scene_textures,
+        scene_texture_sampler,
+        layer_uv(mat, uv),
+        i32(mat.texture_index),
+        level,
+    );
+    return vec4<f32>(mat.albedo.rgb * texel.rgb, texel.a);
+}
 
 // Simplified shadow map: depth rendered from the point of view of light[0]
 // only. Used by the rasterised path; the traced path casts shadow rays for
@@ -194,11 +253,13 @@ fn fresnel_weight(normal: vec3<f32>, view_dir: vec3<f32>) -> f32 {
     return pow(1.0 - facing, 5.0);
 }
 
+// Must match the VertexOutput in scene_vertex.wgsl location for location.
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
     @location(1) world_pos: vec3<f32>,
     @location(2) @interpolate(flat) material_index: u32,
+    @location(3) uv: vec2<f32>,
 };
 
 /// Filter colour for the glass tint pass.

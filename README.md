@@ -249,8 +249,10 @@ Deliberate trade-offs and rough edges, stated plainly so nobody has to rediscove
 Roadmap items skipped on purpose carry their reasoning in [ROADMAP.md](ROADMAP.md).
 
 **Rendering**
-- Normals are transformed by the model matrix directly. Correct for rotation and *uniform*
-  scale; non-uniform scale needs the inverse-transpose (noted in `scene_vertex.wgsl`).
+- Normals in the rasterised path use a per-object inverse-transpose matrix, so non-uniform
+  scale is handled. The exception is *secondary* traced hits: a `TracedInstance` carries no
+  normal matrix, so a non-uniformly scaled mesh seen in a reflection or through glass still
+  has its normals rotated by the instance basis only (noted in `scene_traced_fragment.wgsl`).
 - The traced sampler is seeded by pixel position only, not by frame number. Re-seeding per
   frame changed 19% of pixels on a still scene, which the ASCII stage renders as crawling
   shimmer. The cost is a fixed dither pattern instead of noise that averages out.
@@ -267,9 +269,10 @@ Roadmap items skipped on purpose carry their reasoning in [ROADMAP.md](ROADMAP.m
 **Physics**
 - No angular dynamics — no angular velocity, inertia tensor or torque. A rolling and a
   sliding sphere look identical once quantised to character cells.
-- The Cornell Box demo has no colliders: it bakes world positions into vertices instead of
-  using transforms, so a local collider would land at the origin. Convert it to transforms
-  before reviving it.
+- The Cornell Box demo builds its geometry at the origin and places it with transforms, and
+  every entity carries an analytic collider. Note the walls' colliders are bounded planes and
+  the boxes' are `Shape::Box`, which (until oriented boxes land) collides axis-aligned — exact
+  here because nothing in the scene is rotated off-axis.
 
 **Scripting**
 - Lua is implemented from scratch here and omits coroutines, metatables other than `__index`,
@@ -283,12 +286,18 @@ Roadmap items skipped on purpose carry their reasoning in [ROADMAP.md](ROADMAP.m
 - Profiler mesh memory counts vertices and indices only. wgpu does not report sizes for
   render targets, depth, shadow maps or acceleration structures, so a total would be a guess
   presented as a measurement.
-- Model/texture hot-reload detects and reports changes but cannot apply them: nothing records
-  which entity uses which file.
-- The editor saves scenes under the name `material_spheres` regardless of what the scene was
-  called — the name is not threaded from the loader into `AppState`.
-- The JSON parser returns `None` for numbers outside f32 range, and the scene loader treats
-  `None` as "field absent", so `1e300` in a scene file silently becomes the default.
+- Model hot-reload detects and reports changes but cannot apply them: nothing records which
+  entity uses which OBJ file. Texture hot-reload *does* apply now — scene materials record
+  their texture paths, so an edited PNG rebuilds the texture array live.
+- The CPU fallback tracer does not sample textures: analytic shapes carry no UVs, so a
+  textured material renders in its flat albedo colour there.
+- Alpha-tested surfaces cast opaque shadows in the traced path: honouring the cutout per
+  shadow ray would forfeit TERMINATE_ON_FIRST_HIT. A fence shadows as a wall.
+- All texture-array layers share one size (the maximum over the scene's textures); smaller
+  images are edge-padded and their UVs rescaled. Wildly mixed texture sizes waste memory.
+- The editor saves a scene back under its own `name` and to the file it was loaded (or
+  hot-reloaded) from. Numbers outside f32 range in a scene file are a parse error with a byte
+  offset, not a silent fallback to the field's default.
 
 **Testing**
 - GPU-dependent logic (transparent sorting, readback, the shadow pass, in-shader light

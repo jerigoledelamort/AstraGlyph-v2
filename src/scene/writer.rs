@@ -31,6 +31,7 @@ use crate::scene::{
 pub enum MeshSource {
     Plane { size: f32 },
     Sphere { radius: f32, rings: u32, segments: u32 },
+    Box { half_extents: Vec3 },
     Obj { path: String },
 }
 
@@ -48,13 +49,8 @@ impl MeshSource {
             Shape::Plane { half_size, .. } => Self::Plane {
                 size: half_size * 2.0,
             },
-            // A box has no scene-format spelling yet, so it is written as the sphere
-            // that encloses it. Documented rather than silently dropped: a saved box
-            // coming back as a sphere is surprising, and losing it entirely is worse.
-            Shape::Box { half_extents } => Self::Sphere {
-                radius: half_extents.length(),
-                rings: 16,
-                segments: 24,
+            Shape::Box { half_extents } => Self::Box {
+                half_extents: *half_extents,
             },
         }
     }
@@ -73,6 +69,10 @@ pub struct SceneDocument<'a> {
     pub hierarchy: &'a Hierarchy,
     /// Mesh descriptors by entity id, for entities whose original form is known.
     pub mesh_sources: &'a HashMap<u64, MeshSource>,
+    /// Texture paths by `texture_index`, from `LoadedScene::textures`. A material
+    /// whose index has no entry here is written without its texture — the index
+    /// alone is meaningless in a file that a fresh load will re-number anyway.
+    pub textures: &'a [String],
 }
 
 /// Serialise a scene to the loader's JSON format.
@@ -259,6 +259,16 @@ fn write_entity(out: &mut String, document: &SceneDocument<'_>, entity: Entity, 
             out.push_str(&format!("{inner}  \"color\": {}\n", vec3_json(color)));
             out.push_str(&format!("{inner}}},\n"));
         }
+        Some(MeshSource::Box { half_extents }) => {
+            out.push_str(&format!("{inner}\"mesh\": {{\n"));
+            out.push_str(&format!("{inner}  \"type\": \"box\",\n"));
+            out.push_str(&format!(
+                "{inner}  \"half_extents\": {},\n",
+                vec3_json(half_extents)
+            ));
+            out.push_str(&format!("{inner}  \"color\": {}\n", vec3_json(color)));
+            out.push_str(&format!("{inner}}},\n"));
+        }
         Some(MeshSource::Obj { path }) => {
             out.push_str(&format!("{inner}\"mesh\": {{\n"));
             out.push_str(&format!("{inner}  \"type\": \"obj\",\n"));
@@ -320,6 +330,17 @@ fn write_entity(out: &mut String, document: &SceneDocument<'_>, entity: Entity, 
             ",\n{inner}  \"transparency\": {}",
             number(material.transparency)
         ));
+    }
+    // The texture is written as its path, resolved through the document's
+    // texture table — indices are load-order artifacts and do not survive a
+    // round trip on their own.
+    if material.has_texture() {
+        if let Some(path) = document.textures.get(material.texture_index as usize) {
+            out.push_str(&format!(",\n{inner}  \"texture\": {}", quote(path)));
+        }
+    }
+    if material.flags & crate::scene::component::material_flags::ALPHA_TEST != 0 {
+        out.push_str(&format!(",\n{inner}  \"alpha_test\": true"));
     }
     out.push('\n');
     out.push_str(&format!("{inner}}}"));
@@ -522,6 +543,7 @@ mod tests {
             lights,
             hierarchy,
             mesh_sources: sources,
+            textures: &[],
         });
         parse_scene(&json).unwrap_or_else(|e| panic!("saved scene failed to reload: {e}\n{json}"))
     }
@@ -548,6 +570,55 @@ mod tests {
             .filter(|e| loaded.hierarchy.parent(**e).is_some())
             .count();
         assert_eq!(parented, 1, "the hierarchy was lost");
+    }
+
+    /// A textured, alpha-tested material must keep its texture path and flag
+    /// across save/load — the стадия-1 addition to the round-trip property.
+    #[test]
+    fn textured_materials_survive_the_round_trip() {
+        let mut scene = Scene::new();
+        let hierarchy = Hierarchy::new();
+        let mut sources = HashMap::new();
+
+        let e = scene.create_entity();
+        scene.add_component(e, sphere(Vec3::ZERO, 1.0, Vec3::ONE, 8, 12));
+        scene.add_component(e, ColliderComponent::new(sphere_shape(1.0)));
+        scene.add_component(
+            e,
+            MaterialComponent::matte(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.1, 0.9)
+                .with_texture(0)
+                .with_alpha_test(),
+        );
+        scene.add_component(e, TransformComponent { local: Transform::identity() });
+        sources.insert(e.id(), MeshSource::Sphere { radius: 1.0, rings: 8, segments: 12 });
+
+        let camera = Camera::new(
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::ZERO,
+            Vec3::UNIT_Y,
+            Projection::perspective(radians(60.0), 1.0, 0.1, 100.0),
+        );
+        let textures = vec!["assets/textures/checker.png".to_string()];
+        let json = to_json(&SceneDocument {
+            name: "textured",
+            scene: &scene,
+            camera: &camera,
+            lights: &[],
+            hierarchy: &hierarchy,
+            mesh_sources: &sources,
+            textures: &textures,
+        });
+        let loaded = parse_scene(&json)
+            .unwrap_or_else(|e| panic!("textured scene failed to reload: {e}\n{json}"));
+
+        assert_eq!(loaded.textures, textures, "the texture path must survive");
+        let entity = loaded.scene.entities_with::<MaterialComponent>()[0];
+        let m = loaded.scene.get_component::<MaterialComponent>(entity).unwrap();
+        assert_eq!(m.texture_index, 0);
+        assert!(
+            m.flags & crate::scene::component::material_flags::ALPHA_TEST != 0,
+            "alpha_test must survive"
+        );
     }
 
     /// Transforms are what an editor changes, so losing one would defeat the point.
@@ -717,6 +788,7 @@ mod tests {
             lights: &lights,
             hierarchy: &hierarchy,
             mesh_sources: &sources,
+            textures: &[],
         };
         assert_eq!(to_json(&document), to_json(&document));
     }
@@ -733,6 +805,7 @@ mod tests {
             lights: &lights,
             hierarchy: &hierarchy,
             mesh_sources: &sources,
+            textures: &[],
         });
         let loaded = parse_scene(&first).expect("first save should reload");
         // The reloaded scene has no recorded descriptors, so they come from colliders
@@ -744,6 +817,7 @@ mod tests {
             lights: &loaded.lights,
             hierarchy: &loaded.hierarchy,
             mesh_sources: &HashMap::new(),
+            textures: &[],
         });
         let third_load = parse_scene(&second).expect("second save should reload");
         let third = to_json(&SceneDocument {
@@ -753,6 +827,7 @@ mod tests {
             lights: &third_load.lights,
             hierarchy: &third_load.hierarchy,
             mesh_sources: &HashMap::new(),
+            textures: &[],
         });
         assert_eq!(
             second, third,
@@ -815,6 +890,7 @@ mod tests {
             lights: &lights,
             hierarchy: &hierarchy,
             mesh_sources: &sources,
+            textures: &[],
         });
         let loaded = parse_scene(&json).expect("a quoted name must not break the document");
         assert_eq!(loaded.name, "he said \"hello\"");
@@ -838,6 +914,7 @@ mod tests {
             lights: &[],
             hierarchy: &Hierarchy::new(),
             mesh_sources: &HashMap::new(),
+            textures: &[],
         });
         let loaded = parse_scene(&json).expect("an empty scene must still be valid JSON");
         assert!(loaded.scene.all_entities().is_empty());
@@ -871,6 +948,7 @@ mod tests {
             lights: &[],
             hierarchy: &Hierarchy::new(),
             mesh_sources: &HashMap::new(),
+            textures: &[],
         });
         let loaded = parse_scene(&json).expect("should reload");
         assert_eq!(loaded.scene.entities_with::<MeshComponent>().len(), 1);
@@ -888,19 +966,55 @@ mod tests {
         }
     }
 
-    /// A box has no scene-format spelling, so it becomes its enclosing sphere.
-    /// Surprising, but losing the entity would be worse — and it is documented.
+    /// Boxes gained a scene-format spelling with texturing (стадия 1), so a
+    /// box collider now round-trips as a box rather than its enclosing sphere.
     #[test]
-    fn a_box_collider_is_written_as_its_enclosing_sphere() {
-        let source = MeshSource::from_shape(&Shape::Box {
-            half_extents: Vec3::new(1.0, 2.0, 2.0),
+    fn a_box_collider_is_written_as_a_box() {
+        let half = Vec3::new(1.0, 2.0, 2.0);
+        let source = MeshSource::from_shape(&Shape::Box { half_extents: half });
+        assert_eq!(source, MeshSource::Box { half_extents: half });
+    }
+
+    /// And the full round trip: a box mesh entity saves and reloads as a box.
+    #[test]
+    fn a_box_mesh_survives_the_round_trip() {
+        let mut scene = Scene::new();
+        let half = Vec3::new(0.5, 1.0, 0.25);
+        let e = scene.create_entity();
+        scene.add_component(e, crate::scene::box_mesh(half, Vec3::ONE));
+        scene.add_component(e, ColliderComponent::new(Shape::Box { half_extents: half }));
+        scene.add_component(e, MaterialComponent::default());
+        scene.add_component(e, TransformComponent { local: Transform::identity() });
+        let mut sources = HashMap::new();
+        sources.insert(e.id(), MeshSource::Box { half_extents: half });
+
+        let camera = Camera::new(
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::ZERO,
+            Vec3::UNIT_Y,
+            Projection::perspective(radians(60.0), 1.0, 0.1, 100.0),
+        );
+        let json = to_json(&SceneDocument {
+            name: "boxed",
+            scene: &scene,
+            camera: &camera,
+            lights: &[],
+            hierarchy: &Hierarchy::new(),
+            mesh_sources: &sources,
+            textures: &[],
         });
-        match source {
-            MeshSource::Sphere { radius, .. } => {
-                assert!((radius - 3.0).abs() < 1e-4, "should enclose the box: {radius}")
+        let loaded = parse_scene(&json)
+            .unwrap_or_else(|err| panic!("box scene failed to reload: {err}\n{json}"));
+        let entity = loaded.scene.entities_with::<MeshComponent>()[0];
+        let collider = loaded.scene.get_component::<ColliderComponent>(entity).unwrap();
+        match collider.shape {
+            Shape::Box { half_extents } => {
+                assert!((half_extents - half).length() < 1e-5, "got {half_extents}")
             }
-            other => panic!("expected a sphere, got {other:?}"),
+            other => panic!("expected a box, got {other:?}"),
         }
+        let mesh = loaded.scene.get_component::<MeshComponent>(entity).unwrap();
+        assert_eq!(mesh.vertices.len(), 24, "the box mesh regenerated per-face");
     }
 
     /// Writing to disk uses a temporary file and a rename, so an interrupted save
@@ -925,6 +1039,7 @@ mod tests {
                 lights: &lights,
                 hierarchy: &hierarchy,
                 mesh_sources: &sources,
+                textures: &[],
             },
         )
         .expect("save should succeed");

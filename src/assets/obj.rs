@@ -22,7 +22,7 @@
 // author needs to see — silently flipping it would hide a broken export.
 
 use crate::engine::core::{EngineError, Result};
-use crate::engine::math::Vec3;
+use crate::engine::math::{Vec2, Vec3};
 use crate::scene::component::{MeshComponent, MeshVertex};
 
 /// Default colour for a mesh whose file carries none.
@@ -219,6 +219,7 @@ pub fn parse(source: &str) -> Result<ObjModel> {
                                 corner,
                                 &positions,
                                 &normals,
+                                &texcoords,
                                 &vertex_colors,
                             ));
                         }
@@ -256,6 +257,7 @@ fn build_vertex(
     corner: FaceVertex,
     positions: &[Vec3],
     normals: &[Vec3],
+    texcoords: &[[f32; 2]],
     colors: &[Option<Vec3>],
 ) -> MeshVertex {
     MeshVertex {
@@ -273,6 +275,14 @@ fn build_vertex(
             .copied()
             .flatten()
             .unwrap_or(DEFAULT_COLOR),
+        // OBJ's v axis points up the image; GPU texture space has v growing
+        // downward, so v is flipped here — once, at the boundary between the two
+        // conventions, rather than in every shader that samples.
+        uv: corner
+            .texcoord
+            .and_then(|i| texcoords.get(i).copied())
+            .map(|[u, v]| Vec2::new(u, 1.0 - v))
+            .unwrap_or(Vec2::new(0.0, 0.0)),
     }
 }
 
@@ -448,6 +458,50 @@ f 1/1/1 2/1/1 3/1/1
         let model = parse(source).unwrap();
         assert_eq!(model.skipped_faces, 0, "every form should have parsed");
         assert_eq!(model.mesh.indices.len(), 12, "four triangles");
+    }
+
+    /// `vt` must reach the vertex, v-flipped into GPU texture space.
+    #[test]
+    fn texcoords_are_carried_to_vertices_with_v_flipped() {
+        let source = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0.25 0.75
+vt 1.0 0.0
+vt 0.0 1.0
+f 1/1 2/2 3/3
+";
+        let model = parse(source).unwrap();
+        assert_eq!(model.mesh.vertices[0].uv, Vec2::new(0.25, 0.25), "v flipped: 1 - 0.75");
+        assert_eq!(model.mesh.vertices[1].uv, Vec2::new(1.0, 1.0));
+        assert_eq!(model.mesh.vertices[2].uv, Vec2::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn a_face_without_texcoords_gets_zero_uv() {
+        let model = parse(TRIANGLE).unwrap();
+        for v in &model.mesh.vertices {
+            assert_eq!(v.uv, Vec2::new(0.0, 0.0));
+        }
+    }
+
+    /// The same position with different texcoords must split into two vertices —
+    /// the mirror of the different-normals case, and what makes a UV seam work.
+    #[test]
+    fn the_same_position_with_different_texcoords_becomes_two_vertices() {
+        let source = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 1 1 0
+vt 0 0
+vt 1 1
+f 1/1 2/1 3/1
+f 1/2 2/2 4/2
+";
+        let model = parse(source).unwrap();
+        assert_eq!(model.mesh.vertices.len(), 6, "UV seams must not be merged");
     }
 
     /// A quad must become two triangles: the renderer draws TriangleList, and a quad

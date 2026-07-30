@@ -30,11 +30,10 @@ pub use component::{
     TransformComponent,
 };
 pub use entity::Entity;
-// `box_shape` is exported from `primitives` but not re-exported here: the only
-// box geometry in the engine is the Cornell Box demo, which bakes world
-// positions into its vertices instead of using transforms, so a local-space
-// collider would sit at the origin rather than at the wall.
-pub use primitives::{plane, plane_shape, sphere, sphere_shape};
+// `box_shape` joined the re-exports when the Cornell Box demo moved to
+// transform-placed geometry: its inner boxes are the engine's first
+// local-space box meshes, so a local-space box collider finally has a consumer.
+pub use primitives::{box_mesh, box_shape, plane, plane_shape, sphere, sphere_shape};
 pub use scene::Scene;
 #[allow(unused_imports)]
 pub use writer::{MeshSource, SceneDocument};

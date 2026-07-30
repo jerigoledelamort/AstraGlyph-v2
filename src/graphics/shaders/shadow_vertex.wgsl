@@ -11,8 +11,12 @@ struct LightSpace {
 
 @group(0) @binding(0) var<uniform> light_space: LightSpace;
 
+// Must match `renderer::scene_pass::ObjectUniform` and scene_vertex.wgsl's
+// Object exactly — same storage buffer, same stride. The normal matrix is
+// unused here (depth has no normals) but must still occupy its slot.
 struct Object {
     model: mat4x4<f32>,
+    normal: mat4x4<f32>,
     material_index: u32,
 };
 

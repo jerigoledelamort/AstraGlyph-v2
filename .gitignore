@@ -16,6 +16,7 @@ Thumbs.db
 # Local-only files
 COMMIT_GUIDELINES.md
 AGENTS.md
+ASTRAGLYPH_PLAN.md
 
 # Agent artifacts
 .agent/
