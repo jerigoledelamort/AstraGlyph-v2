@@ -234,10 +234,72 @@ Current status: **MVP Pre-Alpha** (tag: `mvp-pre-alpha`)
 - **Phase 1**: Depth buffer, GPU buffer caching, async readback, Phong lighting
 - **Phase 2**: Model transforms, scene graph, frustum culling
 - **Phase 3**: Dynamic cell grid, Unicode glyphs, post-processing, ASCII UI
-- **Phase 4**: Physics, audio, Lua scripting, ECS overhaul
-- **Phase 5**: Scene editor, asset pipeline, profiler
+- **Phase 4**: Hardware ray tracing (RTX) — traced shadows, reflections and refraction,
+  with an analytic CPU fallback
+- **Phase 5**: Physics, audio, Lua scripting, archetype ECS
+- **Phase 6**: Scene editor, asset pipeline, profiler
 
-**Victory condition**: A playable game built on AstraGlyph, then the engine is declared "1.0 — Game Engine".
+**Victory condition**: A playable game built on AstraGlyph, then the engine is declared
+"1.0 — Game Engine". No game exists yet, so this is explicitly **not** met — every phase so
+far builds the engine, not a game.
+
+## ⚠️ Known Limitations
+
+Deliberate trade-offs and rough edges, stated plainly so nobody has to rediscover them.
+Roadmap items skipped on purpose carry their reasoning in [ROADMAP.md](ROADMAP.md).
+
+**Rendering**
+- Normals are transformed by the model matrix directly. Correct for rotation and *uniform*
+  scale; non-uniform scale needs the inverse-transpose (noted in `scene_vertex.wgsl`).
+- The traced sampler is seeded by pixel position only, not by frame number. Re-seeding per
+  frame changed 19% of pixels on a still scene, which the ASCII stage renders as crawling
+  shimmer. The cost is a fixed dither pattern instead of noise that averages out.
+- The rasterised path's shadow map covers one light, without cascades or PCF beyond bilinear
+  comparison. Ray tracing does not render it at all.
+- The CPU fallback tracer only sees analytic shapes, not triangles: a mesh without a
+  `ColliderComponent` will not appear in it. `intersect_triangle` exists in
+  `engine/geometry/ray.rs` but is not wired in — at ~1536 triangles per sphere it would not
+  be interactive.
+- Analytic shapes do not model rotation: a rotated box stays axis-aligned, and a
+  non-uniformly scaled sphere takes its largest axis, so the volume encloses the mesh rather
+  than matching it. Exact for the demo scene (spheres + plane, uniform scale).
+
+**Physics**
+- No angular dynamics — no angular velocity, inertia tensor or torque. A rolling and a
+  sliding sphere look identical once quantised to character cells.
+- The Cornell Box demo has no colliders: it bakes world positions into vertices instead of
+  using transforms, so a local collider would land at the origin. Convert it to transforms
+  before reviving it.
+
+**Scripting**
+- Lua is implemented from scratch here and omits coroutines, metatables other than `__index`,
+  `goto`, `io`/`os`, and `table.sort` with a comparator. Each unsupported case raises an error
+  rather than silently returning something wrong.
+
+**Tooling & assets**
+- The `submit` figure in the log measures wall-clock around `submit` — the cost of handing
+  work to the GPU, not GPU work itself. Real GPU timings come from the profiler (**F3**) via
+  timestamp queries.
+- Profiler mesh memory counts vertices and indices only. wgpu does not report sizes for
+  render targets, depth, shadow maps or acceleration structures, so a total would be a guess
+  presented as a measurement.
+- Model/texture hot-reload detects and reports changes but cannot apply them: nothing records
+  which entity uses which file.
+- The editor saves scenes under the name `material_spheres` regardless of what the scene was
+  called — the name is not threaded from the loader into `AppState`.
+- The JSON parser returns `None` for numbers outside f32 range, and the scene loader treats
+  `None` as "field absent", so `1e300` in a scene file silently becomes the default.
+
+**Testing**
+- GPU-dependent logic (transparent sorting, readback, the shadow pass, in-shader light
+  accumulation, culling inside `render()`) has no unit tests — there is no wgpu device in the
+  test environment. It is verified by running the engine and reading the
+  `drawn/culled/materials` log, plus tests of the pure parts.
+- **Nothing about the rendered image has been verified by eye.** Every visual claim in the
+  commit history is a pixel measurement of the render target. Worth checking yourself: whether
+  the mirror sphere actually reflects the red sphere and the ground rather than just a
+  gradient; whether refracted geometry is visible through the glass; whether the AO dither
+  reads as texture or as dirt; whether the OBJ pyramid is lit correctly and not inside-out.
 
 ## 📜 License
 
