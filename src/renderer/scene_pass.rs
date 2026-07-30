@@ -15,6 +15,7 @@ use crate::engine::math::{Mat4, Vec3};
 use crate::graphics::buffer;
 use crate::graphics::pipeline;
 use crate::graphics::texture;
+use crate::graphics::timing::{GpuPass, GpuTimer};
 use crate::scene::component::MeshVertex;
 use crate::scene::{Camera, Entity, MeshComponent, MaterialUniform};
 use wgpu::{Device, Queue, Texture, TextureFormat, TextureView};
@@ -225,6 +226,13 @@ pub struct ScenePipeline {
     /// Camera position from the last `update_camera` call, used to sort
     /// transparent meshes back-to-front.
     camera_pos: Vec3,
+    /// Draw calls issued by the most recent `render_batched`.
+    ///
+    /// Counted rather than derived from the mesh count, because they are not the
+    /// same number: the rasterised path draws transparent meshes twice (tint, then
+    /// surface) and the traced path draws everything once. A profiler reporting the
+    /// mesh count as the draw count would hide exactly that difference.
+    draw_calls: u32,
     /// Simplified shadow map: depth-only pass from light[0]'s point of view.
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_bind_group: wgpu::BindGroup,
@@ -688,6 +696,7 @@ impl ScenePipeline {
             height,
             buffer_cache: HashMap::new(),
             camera_pos: Vec3::ZERO,
+            draw_calls: 0,
             shadow_pipeline,
             shadow_bind_group,
             shadow_texture,
@@ -712,11 +721,13 @@ impl ScenePipeline {
         device: &Device,
         queue: &Queue,
         drawable: &[(Entity, u32)],
+        timer: &mut GpuTimer,
     ) {
         if drawable.is_empty() {
             return;
         }
 
+        let mut shadow_draws;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("shadow_pass_encoder"),
         });
@@ -733,24 +744,27 @@ impl ScenePipeline {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timer.pass_writes(GpuPass::Shadow),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
             rpass.set_pipeline(&self.shadow_pipeline);
             rpass.set_bind_group(0, &self.shadow_bind_group, &[]);
+            shadow_draws = 0;
 
             for (entity, object_index) in drawable {
                 if let Some(bufs) = self.buffer_cache.get(&entity.id()) {
                     rpass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
                     rpass.set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                    shadow_draws += 1;
                 }
             }
         }
 
         queue.submit(std::iter::once(encoder.finish()));
+        self.draw_calls += shadow_draws;
     }
 
     /// Update the camera uniform (view-projection matrix + position).
@@ -812,6 +826,29 @@ impl ScenePipeline {
         self.traced_pipeline.is_some()
     }
 
+    /// Draw calls issued by the most recent frame, across every pass.
+    pub fn draw_calls(&self) -> u32 {
+        self.draw_calls
+    }
+
+    /// Bytes of GPU memory held by cached mesh buffers.
+    ///
+    /// An estimate of the vertex and index data only — not the render targets,
+    /// depth buffer, shadow map or acceleration structures, whose sizes wgpu does
+    /// not expose. Reported as "mesh bytes" rather than "GPU memory" so the number
+    /// is not mistaken for the total.
+    pub fn mesh_bytes(&self) -> u64 {
+        self.buffer_cache
+            .values()
+            .map(|b| b.vertex_buffer.size() + b.index_buffer.size())
+            .sum()
+    }
+
+    /// Meshes with cached GPU buffers.
+    pub fn cached_meshes(&self) -> usize {
+        self.buffer_cache.len()
+    }
+
     /// The scene depth buffer. Exposed for CPU readback: screen-space effects
     /// (SSAO, depth-driven cell subdivision) consume it on the ASCII side.
     pub fn depth_texture(&self) -> &Texture {
@@ -871,6 +908,7 @@ impl ScenePipeline {
         objects: &[ObjectUniform],
         materials: &[MaterialUniform],
         traced: Option<&wgpu::BindGroup>,
+        timer: &mut GpuTimer,
     ) -> Result<()> {
         if meshes.is_empty() {
             return Ok(());
@@ -893,12 +931,14 @@ impl ScenePipeline {
             return Ok(());
         }
 
+        self.draw_calls = 0;
+
         // Simplified shadow map: depth-only pass from light[0]'s point of view.
         // Must run before the main pass since the fragment shader samples it.
         // Skipped entirely when tracing: the traced shader never samples the map,
         // so rendering it would be pure cost.
         if traced.is_none() {
-            self.render_shadow_pass(device, queue, &drawable);
+            self.render_shadow_pass(device, queue, &drawable, timer);
         }
 
         // Classify by material transparency; transparent meshes carry their
@@ -958,13 +998,14 @@ impl ScenePipeline {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timer.pass_writes(GpuPass::Scene),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
             rpass.set_bind_group(0, &self.bind_group, &[]);
 
+            let mut drawn = 0u32;
             if let (Some(traced_group), Some(traced_pipeline)) =
                 (traced, self.traced_pipeline.as_ref())
             {
@@ -980,6 +1021,7 @@ impl ScenePipeline {
                         rpass
                             .set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                        drawn += 1;
                     }
                 }
             } else {
@@ -990,6 +1032,7 @@ impl ScenePipeline {
                         rpass
                             .set_index_buffer(bufs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                        drawn += 1;
                     }
                 }
 
@@ -1009,9 +1052,11 @@ impl ScenePipeline {
 
                         rpass.set_pipeline(&self.transparent_pipeline);
                         rpass.draw_indexed(0..bufs.index_count, 0, *object_index..*object_index + 1);
+                        drawn += 2;
                     }
                 }
             }
+            self.draw_calls += drawn;
         }
 
         queue.submit(std::iter::once(encoder.finish()));

@@ -10,7 +10,7 @@ pub struct FrameMetrics {
     /// Accumulated CPU time across all phases of the frame.
     cpu_time_us: u64,
     /// Estimated GPU time (measured around submit calls).
-    gpu_time_us: u64,
+    submit_time_us: u64,
     /// FPS tracking.
     frame_count: u64,
     fps: f32,
@@ -31,7 +31,7 @@ impl FrameMetrics {
         Self {
             cpu_start: None,
             cpu_time_us: 0,
-            gpu_time_us: 0,
+            submit_time_us: 0,
             frame_count: 0,
             fps: 0.0,
             last_log: Instant::now(),
@@ -58,14 +58,23 @@ impl FrameMetrics {
     pub fn begin_frame(&mut self) {
         self.cpu_start = Some(Instant::now());
         self.cpu_time_us = 0;
-        self.gpu_time_us = 0;
+        self.submit_time_us = 0;
     }
 
-    /// Record a GPU submit phase. Measures wall-clock time around the submit call
-    /// as an approximation of GPU work (not precise, but sufficient for Phase 1).
-    pub fn record_gpu_phase(&mut self, phase_start: Instant) {
+    /// Record time spent handing work to the GPU.
+    ///
+    /// This is wall-clock around `submit`, which is **not** GPU time: `submit`
+    /// returns once the commands are queued, so it measures CPU-side submission
+    /// cost and reads the same whether the GPU took a microsecond or ten
+    /// milliseconds. It was labelled "GPU" through Phase 1-5 and that was
+    /// misleading; the honest per-pass figures come from
+    /// `graphics::timing::GpuTimer` and its timestamp queries.
+    ///
+    /// Kept because it is still a real number worth seeing — submission cost shows
+    /// up here and nowhere else — but named for what it measures.
+    pub fn record_submit_phase(&mut self, phase_start: Instant) {
         let elapsed = phase_start.elapsed().as_micros() as u64;
-        self.gpu_time_us += elapsed;
+        self.submit_time_us += elapsed;
     }
 
     /// Call at the end of render(). Finalizes CPU time and logs if 1s has passed.
@@ -88,10 +97,10 @@ impl FrameMetrics {
         if elapsed >= 1.0 {
             self.fps = self.frame_count as f32 / elapsed;
             eprintln!(
-                "FPS: {:.0}, CPU: {:.1}ms, GPU: {:.1}ms | drawn: {}, culled: {}, materials: {}, glyphs: {}",
+                "FPS: {:.0}, CPU: {:.1}ms, submit: {:.1}ms | drawn: {}, culled: {}, materials: {}, glyphs: {}",
                 self.fps,
                 self.cpu_time_us as f32 / 1000.0,
-                self.gpu_time_us as f32 / 1000.0,
+                self.submit_time_us as f32 / 1000.0,
                 self.drawn,
                 self.culled,
                 self.material_slots,
@@ -105,6 +114,41 @@ impl FrameMetrics {
     /// Current FPS estimate (updated every ~1s).
     pub fn fps(&self) -> f32 {
         self.fps
+    }
+
+    /// CPU time for the last completed frame, in milliseconds.
+    pub fn cpu_ms(&self) -> f32 {
+        self.cpu_time_us as f32 / 1000.0
+    }
+
+    /// Time spent submitting to the GPU, in milliseconds. See
+    /// `record_submit_phase` for why this is not GPU time.
+    pub fn submit_ms(&self) -> f32 {
+        self.submit_time_us as f32 / 1000.0
+    }
+
+    /// Wall-clock frame time implied by the FPS estimate, in milliseconds.
+    ///
+    /// Derived from the FPS average rather than measured per frame: the per-frame
+    /// figure at 1300 FPS is 0.77 ms with enormous variance, and a profiler row that
+    /// flickers is unreadable. Zero FPS (before the first second elapses) reports 0
+    /// rather than dividing by it.
+    pub fn frame_ms(&self) -> f32 {
+        if self.fps > 0.0 {
+            1000.0 / self.fps
+        } else {
+            0.0
+        }
+    }
+
+    /// Glyph quads drawn last frame.
+    pub fn glyph_count(&self) -> usize {
+        self.glyphs
+    }
+
+    /// Meshes drawn and culled last frame.
+    pub fn scene_counts(&self) -> (usize, usize, usize) {
+        (self.drawn, self.culled, self.material_slots)
     }
 }
 
@@ -129,13 +173,52 @@ mod tests {
         assert!(m.cpu_time_us > 0);
     }
 
+    /// Renamed from `metrics_record_gpu_phase` along with the method: what this
+    /// measures is submission cost, not GPU work.
     #[test]
-    fn metrics_record_gpu_phase() {
+    fn metrics_record_submit_phase() {
         let mut m = FrameMetrics::new();
         let start = Instant::now();
         std::thread::sleep(std::time::Duration::from_micros(50));
-        m.record_gpu_phase(start);
-        assert!(m.gpu_time_us > 0);
+        m.record_submit_phase(start);
+        assert!(m.submit_time_us > 0);
+    }
+
+    /// The profiler reads these; a missing accessor is a compile error but a *wrong*
+    /// one is not, so the derivations are pinned.
+    #[test]
+    fn frame_ms_is_the_reciprocal_of_fps_and_safe_at_zero() {
+        let mut metrics = FrameMetrics::new();
+        assert_eq!(
+            metrics.frame_ms(),
+            0.0,
+            "before the first second, dividing by a zero FPS must not produce infinity"
+        );
+        metrics.fps = 200.0;
+        assert!((metrics.frame_ms() - 5.0).abs() < 1e-4, "{}", metrics.frame_ms());
+    }
+
+    #[test]
+    fn the_submit_accessor_reports_what_was_recorded() {
+        let mut metrics = FrameMetrics::new();
+        metrics.begin_frame();
+        let start = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        metrics.record_submit_phase(start);
+        assert!(
+            metrics.submit_ms() >= 1.5,
+            "recorded {} ms for a 2 ms sleep",
+            metrics.submit_ms()
+        );
+    }
+
+    #[test]
+    fn counters_round_trip_through_their_accessors() {
+        let mut metrics = FrameMetrics::new();
+        metrics.set_scene_stats(7, 3, 5);
+        metrics.set_glyph_count(1234);
+        assert_eq!(metrics.scene_counts(), (7, 3, 5));
+        assert_eq!(metrics.glyph_count(), 1234);
     }
 
     #[test]

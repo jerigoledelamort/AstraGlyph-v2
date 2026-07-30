@@ -1,6 +1,7 @@
 // Composite pass: renders ASCII glyphs to the screen surface.
 // Uses a glyph atlas texture and per-cell instance data.
 
+use crate::graphics::timing::{GpuPass, GpuTimer};
 use crate::ascii::{build_combined_atlas, combined_glyph_count, GLYPH_SIZE};
 use crate::engine::core::{cast_slice, Pod, Result};
 use crate::graphics::pipeline;
@@ -250,6 +251,7 @@ pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) ->
         queue: &Queue,
         view: &wgpu::TextureView,
         instance_count: u32,
+        timer: &mut GpuTimer,
     ) {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("composite_encoder"),
@@ -273,7 +275,7 @@ pub fn new(device: &Device, screen_format: TextureFormat, max_instances: u32) ->
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: timer.pass_writes(GpuPass::Composite),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });

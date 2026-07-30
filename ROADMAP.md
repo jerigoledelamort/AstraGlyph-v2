@@ -234,10 +234,24 @@ cores on the target hardware.
 - [ ] Asset hot-reload (edit assets without restarting)
 
 ### 6.3 Profiler
-- [ ] FPS overlay with frame breakdown
-- [ ] GPU timing (render pass, readback, composite)
-- [ ] Memory usage tracking
-- [ ] Draw call / instance count stats
+- [x] Overlay with frame breakdown (F3, or `perf` in the console): frame time, CPU
+      time, per-pass GPU time, draw calls, glyphs, mesh memory, ECS shape, and the
+      acceleration-structure / physics / audio counters when those are live
+- [x] GPU timing via real `wgpu::QuerySet` timestamp queries, per pass
+      (shadow / scene / composite). This replaces the wall-clock-around-`submit`
+      figure `FrameMetrics` reported as "GPU" since Phase 1 — which was never GPU
+      time at all, since `submit` returns as soon as the commands are queued.
+      Measured: the traced scene pass costs **0.078 ms** against **0.0049 ms**
+      rasterised, a 16x difference the old estimate reported as 0.0000 ms for both.
+      The misleading field is now labelled `submit`
+- [x] Memory: bytes held by cached mesh vertex/index buffers, and the buffer count.
+      Reported as "mesh bytes" rather than "GPU memory" because that is what it is —
+      wgpu does not expose render-target, depth, shadow-map or acceleration-structure
+      sizes, so a total would be a guess dressed as a measurement
+- [x] Draw call / instance stats, counted rather than inferred from the mesh count:
+      measured 5 draws on the traced path against 11 rasterised, because the
+      rasteriser draws each transparent mesh twice (tint, then surface). Deriving
+      the number from the mesh count would have hidden exactly that
 
 ---
 

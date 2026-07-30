@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::engine::core::Result;
 use crate::ascii::{compute_tiles, ColorMode, Overlay, OverlayCell, SubdivisionPolicy};
 use crate::engine::math::{degrees, radians, Mat4, Vec3};
+use crate::graphics::timing::GpuTimer;
 use crate::graphics::{FrameOutcome, GraphicsContext};
 use crate::renderer::{
     cpu_trace, post_process, trace_flags, AsciiProcessor, CompositePipeline, CpuObject, CpuScene,
@@ -225,6 +226,7 @@ fn build_menu() -> Menu {
             MenuItem::toggle("Post FX", "post", false),
             MenuItem::toggle("Dynamic grid", "grid", false),
             MenuItem::toggle("HUD", "hud", true),
+            MenuItem::toggle("Profiler", "profiler", false),
             MenuItem::Separator,
             MenuItem::submenu(
                 "Camera",
@@ -322,6 +324,14 @@ pub struct AppState {
     frame_counter: u32,
     /// Seconds since startup, published to scripts as `engine.time`.
     elapsed: f32,
+    /// Real per-pass GPU timings from timestamp queries, replacing the wall-clock
+    /// estimate `FrameMetrics` has always reported. Disabled on adapters without
+    /// `TIMESTAMP_QUERY`, in which case it says so rather than reporting zeros.
+    gpu_timer: GpuTimer,
+    /// Whether the profiler overlay is shown. Off by default: it is a developer
+    /// tool, and eight lines of numbers over a 120x68 grid is most of the screen.
+    profiler_visible: bool,
+    profiler_key_was_down: bool,
     /// Lua host: interpreter, engine bindings and the hot-reload watcher.
     scripts: ScriptHost,
     /// Whether script `update` runs each frame. On by default when a script was
@@ -521,6 +531,10 @@ impl AppState {
             Some(CpuTracer::new(cpu_trace::DEFAULT_SCALE))
         };
 
+        // The GPU timer needs the queue for its tick period, so it is built here
+        // rather than lazily.
+        let gpu_timer = GpuTimer::new(&graphics.device, &graphics.queue);
+
         // Scripts are loaded here so a syntax error is reported at startup next to
         // the GPU and audio lines, rather than silently on the first frame.
         let mut scripts = ScriptHost::new();
@@ -556,6 +570,9 @@ impl AppState {
             cpu_tracer,
             cpu_scene: CpuScene::default(),
             elapsed: 0.0,
+            gpu_timer,
+            profiler_visible: false,
+            profiler_key_was_down: false,
             scripts,
             scripts_enabled,
             scripts_key_was_down: false,
@@ -686,6 +703,12 @@ impl AppState {
 
         // Begin metrics tracking.
         self.metrics.begin_frame();
+        // Fold in whatever GPU timings finished since last frame, then start
+        // recording this one. Collect first: the results being read belong to an
+        // earlier frame, and reading them after `begin_frame` cleared the pass list
+        // would discard them.
+        self.gpu_timer.collect(&self.graphics.device);
+        self.gpu_timer.begin_frame();
 
         // UI first: an open menu or console owns the keyboard, so the camera must
         // not also act on the same keys.
@@ -801,6 +824,22 @@ impl AppState {
             eprintln!("glyphs: style = {:?}", self.glyph_style);
         }
         self.style_key_was_down = style_key_down;
+
+        // F3 toggles the profiler overlay (edge-triggered). F3 rather than a letter
+        // because every letter within reach is already a toggle, and it is the
+        // conventional key for exactly this.
+        let profiler_key_down =
+            shortcuts_active && self.input.is_key_pressed(winit::keyboard::KeyCode::F3);
+        if profiler_key_down && !self.profiler_key_was_down {
+            self.profiler_visible = !self.profiler_visible;
+            if self.profiler_visible && !self.gpu_timer.is_available() {
+                eprintln!(
+                    "profiler: GPU timestamps unavailable on this adapter; \
+                     per-pass timings will be absent"
+                );
+            }
+        }
+        self.profiler_key_was_down = profiler_key_down;
 
         // L toggles script execution (edge-triggered).
         let scripts_key_down =
@@ -1007,8 +1046,9 @@ impl AppState {
             &objects,
             &materials,
             traced_group,
+            &mut self.gpu_timer,
         )?;
-        self.metrics.record_gpu_phase(gpu_start);
+        self.metrics.record_submit_phase(gpu_start);
 
         // Read back the scene render target pixels (double-buffered, non-blocking —
         // may lag the current frame by ~1 frame, never stalls the CPU on the GPU).
@@ -1114,10 +1154,13 @@ impl AppState {
         // menu or console on top of it so a panel covers the stats rather than
         // fighting them for the same cells.
         let ui_open = self.menu.is_open() || self.console.is_open();
-        if self.hud_visible || ui_open {
+        if self.hud_visible || self.profiler_visible || ui_open {
             self.overlay.clear();
             if self.hud_visible {
                 self.draw_hud();
+            }
+            if self.profiler_visible {
+                self.draw_profiler();
             }
             self.menu.draw(&mut self.overlay);
             self.console.draw(&mut self.overlay);
@@ -1146,8 +1189,24 @@ impl AppState {
             &self.graphics.queue,
             &view,
             instance_count,
+            &mut self.gpu_timer,
         );
-        self.metrics.record_gpu_phase(gpu_start);
+        self.metrics.record_submit_phase(gpu_start);
+
+        // Resolve the queries after every timed pass has been submitted. Its own
+        // encoder, submitted last, so the copy cannot precede the passes it reads.
+        {
+            let mut encoder = self.graphics.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("timestamp_resolve_encoder"),
+                },
+            );
+            self.gpu_timer.resolve(&mut encoder);
+            self.graphics.queue.submit(std::iter::once(encoder.finish()));
+            // Only now may the maps be requested: a buffer with an outstanding map
+            // cannot be the target of a submitted copy.
+            self.gpu_timer.after_submit();
+        }
 
         self.graphics.queue.present(frame);
 
@@ -1166,6 +1225,152 @@ impl AppState {
 
     pub fn fps(&self) -> f32 {
         self.metrics.fps()
+    }
+
+    /// Draw the profiler overlay: frame breakdown, GPU per-pass timings, draw
+    /// calls, memory and ECS storage shape.
+    ///
+    /// Drawn on the right-hand side so it does not overlap the HUD, and only the
+    /// rows that have something to say — a profiler that shows "0.00" for a pass
+    /// that did not run reads as "this pass is free".
+    fn draw_profiler(&mut self) {
+        const HEAD: [f32; 3] = [0.6, 0.9, 1.0];
+        const TEXT: [f32; 3] = [0.8, 0.85, 0.9];
+        const WARN: [f32; 3] = [1.0, 0.7, 0.4];
+
+        // Right-aligned block, wide enough for the longest row.
+        let width = 30u32;
+        let x = self.grid_cols.saturating_sub(width + 1);
+        let mut y = 1u32;
+        let row = |overlay: &mut Overlay, y: &mut u32, text: String, colour: [f32; 3]| {
+            overlay.draw_text(x, *y, &text, colour);
+            *y += 1;
+        };
+
+        row(&mut self.overlay, &mut y, "-- PROFILER (F3) --".to_string(), HEAD);
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!(
+                "FRAME {:.2}ms ({:.0} FPS)",
+                self.metrics.frame_ms(),
+                self.metrics.fps()
+            ),
+            TEXT,
+        );
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!("CPU   {:.2}ms", self.metrics.cpu_ms()),
+            TEXT,
+        );
+
+        // GPU: the real numbers if the adapter has them, and an explicit statement
+        // if not. Reporting the wall-clock estimate as "GPU" is what this replaces.
+        if self.gpu_timer.is_available() {
+            let breakdown = self.gpu_timer.breakdown();
+            if breakdown.is_empty() {
+                row(
+                    &mut self.overlay,
+                    &mut y,
+                    "GPU   measuring...".to_string(),
+                    TEXT,
+                );
+            } else {
+                row(
+                    &mut self.overlay,
+                    &mut y,
+                    format!("GPU   {:.3}ms total", self.gpu_timer.total_ms()),
+                    HEAD,
+                );
+                for (pass, ms) in breakdown {
+                    row(
+                        &mut self.overlay,
+                        &mut y,
+                        format!("  {:<9} {:.3}ms", pass.label(), ms),
+                        TEXT,
+                    );
+                }
+            }
+        } else {
+            row(
+                &mut self.overlay,
+                &mut y,
+                "GPU   no timestamp support".to_string(),
+                WARN,
+            );
+        }
+
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!(
+                "DRAWS {} ({} drawn, {} cull)",
+                self.scene_pipeline.draw_calls(),
+                self.drawn_count,
+                self.culled_count
+            ),
+            TEXT,
+        );
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!("GLYPHS {}", self.metrics.glyph_count()),
+            TEXT,
+        );
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!(
+                "MESH  {} KiB in {} bufs",
+                self.scene_pipeline.mesh_bytes() / 1024,
+                self.scene_pipeline.cached_meshes()
+            ),
+            TEXT,
+        );
+        let (archetypes, migrations) = self.scene.storage_stats();
+        row(
+            &mut self.overlay,
+            &mut y,
+            format!("ECS   {archetypes} arch, {migrations} moves"),
+            TEXT,
+        );
+        if let Some(rt) = self.ray_tracer.as_ref() {
+            row(
+                &mut self.overlay,
+                &mut y,
+                format!(
+                    "AS    {} tris, {} builds",
+                    rt.triangle_count(),
+                    rt.blas_builds() + rt.tlas_builds()
+                ),
+                TEXT,
+            );
+        }
+        if self.physics_enabled {
+            row(
+                &mut self.overlay,
+                &mut y,
+                format!(
+                    "PHYS  {} bodies, {} contacts",
+                    self.physics.len(),
+                    self.physics.contacts().len()
+                ),
+                TEXT,
+            );
+        }
+        if self.mixer.voice_count() > 0 {
+            row(
+                &mut self.overlay,
+                &mut y,
+                format!(
+                    "SND   {} voices, {} starve",
+                    self.mixer.voice_count(),
+                    self.audio_device.starved()
+                ),
+                TEXT,
+            );
+        }
     }
 
     /// Reload changed scripts, run their `update`, and apply what they asked for.
@@ -1792,6 +1997,7 @@ impl AppState {
         self.menu.set_toggle("post", self.post.any_enabled());
         self.menu.set_toggle("grid", self.subdivision.merges());
         self.menu.set_toggle("hud", self.hud_visible);
+        self.menu.set_toggle("profiler", self.profiler_visible);
     }
 
     /// Apply what the menu reported.
@@ -1839,6 +2045,7 @@ impl AppState {
                     }
                 }
                 "hud" => self.hud_visible = on,
+                "profiler" => self.profiler_visible = on,
                 _ => {}
             },
             MenuEvent::Chose(id, index) => match id.as_str() {
@@ -1912,6 +2119,7 @@ impl AppState {
                 self.console.print("  lua <code>        evaluate Lua");
                 self.console.print("  scripts [on|off]  run the script's update()");
                 self.console.print("  reload            reload watched scripts");
+                self.console.print("  perf              frame timing breakdown");
                 self.console.print("  clear             wipe the scrollback");
                 self.console.print("  quit              exit");
             }
@@ -2172,6 +2380,44 @@ impl AppState {
                         .console
                         .print(format!("reload: {reloaded} file(s) changed")),
                 }
+            }
+            "perf" => {
+                self.console.print(format!(
+                    "frame: {:.2}ms ({:.0} FPS), cpu {:.2}ms",
+                    self.metrics.frame_ms(),
+                    self.metrics.fps(),
+                    self.metrics.cpu_ms()
+                ));
+                if self.gpu_timer.is_available() {
+                    let breakdown = self.gpu_timer.breakdown();
+                    if breakdown.is_empty() {
+                        self.console.print("gpu: no samples yet");
+                    } else {
+                        self.console.print(format!(
+                            "gpu: {:.3}ms total over {} samples",
+                            self.gpu_timer.total_ms(),
+                            self.gpu_timer.samples()
+                        ));
+                        for (pass, ms) in breakdown {
+                            self.console
+                                .print(format!("  {}: {:.3}ms", pass.label(), ms));
+                        }
+                    }
+                } else {
+                    self.console
+                        .print_error("gpu: this adapter has no TIMESTAMP_QUERY support");
+                }
+                self.console.print(format!(
+                    "draws: {}, glyphs: {}, mesh: {} KiB in {} buffers",
+                    self.scene_pipeline.draw_calls(),
+                    self.metrics.glyph_count(),
+                    self.scene_pipeline.mesh_bytes() / 1024,
+                    self.scene_pipeline.cached_meshes()
+                ));
+                let (archetypes, migrations) = self.scene.storage_stats();
+                self.console.print(format!(
+                    "ecs: {archetypes} archetypes, {migrations} structural moves"
+                ));
             }
             "clear" => {
                 self.console.handle(ConsoleAction::Clear);

@@ -97,6 +97,13 @@ impl GraphicsContext {
         let ray_query = wgpu::Features::from(wgpu::FeaturesWGPU::EXPERIMENTAL_RAY_QUERY);
         let adapter_features = adapter.features();
         let adapter_supports = adapter_features.contains(ray_query);
+
+        // Timestamp queries, for honest per-pass GPU timings (Phase 6.3). Optional
+        // and requested only if present: asking for a feature the adapter lacks
+        // fails the whole device request, which would trade a profiler for a
+        // renderer.
+        let timestamps = wgpu::Features::from(wgpu::FeaturesWebGPU::TIMESTAMP_QUERY);
+        let want_timestamps = adapter_features.contains(timestamps);
         let vetoed = capabilities::ray_tracing_vetoed();
         let request_ray_query = capabilities::should_request_ray_query(adapter_supports, vetoed);
 
@@ -108,10 +115,15 @@ impl GraphicsContext {
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("AstraGlyph Device"),
-            required_features: if request_ray_query {
-                ray_query
-            } else {
-                wgpu::Features::empty()
+            required_features: {
+                let mut features = wgpu::Features::empty();
+                if request_ray_query {
+                    features |= ray_query;
+                }
+                if want_timestamps {
+                    features |= timestamps;
+                }
+                features
             },
             required_limits: if request_ray_query {
                 acceleration_structure_limits(&adapter.limits())
@@ -149,6 +161,14 @@ impl GraphicsContext {
         eprintln!(
             "raytracing: {} (tlas capacity {tlas_capacity})",
             ray_tracing.describe()
+        );
+        eprintln!(
+            "profiler: gpu timestamps {}",
+            if device.features().contains(timestamps) {
+                "available"
+            } else {
+                "unavailable, GPU times will be wall-clock estimates"
+            }
         );
 
         let caps = surface.get_capabilities(&adapter);
